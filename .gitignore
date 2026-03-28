@@ -1,0 +1,16 @@
+# Model weights
+*.pt
+
+# Output videos
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.env
