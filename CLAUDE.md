@@ -41,7 +41,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 
 ### Concrete Trackers (each in its own folder)
 - `padeldet/player_tracker/` — YOLO + ByteTrack (implemented)
-- `padeldet/ball_tracker/` — future
+- `padeldet/ball_tracker/` — MOG2 background subtraction + HSV color + linear motion prediction
 
 ### Court Module (`padeldet/court/`)
 - **Not a Tracker** — court detection is static, not a tracking problem
@@ -49,6 +49,14 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - `projection.py` — `CourtProjection` (homography via `cv2.findHomography`), point projection, court polygon check, `draw_mini_court()` overlay
 - Supports partial keypoints (some can be None/skipped), needs ≥4 for homography
 - Manual calibration via `scripts/calibrate_court.py`, auto-detection can be added later
+
+### Ball Tracker (`padeldet/ball_tracker/`)
+- `BallTrackerConfig` — HSV range, contour area limits, MOG2 params, search radius, max lost frames
+- `BallTracker` — implements Tracker ABC, pure OpenCV (no GPU)
+- Detection state machine: init mode (MOG2+HSV, pick smallest blob) -> tracking mode (linear prediction + nearest blob) -> color fallback -> lost
+- Ball represented as `TrackedDetection` with synthetic small bbox via `ball_detection()` helper in `models.py`
+- `confidence=0.0` means ball not visible in that frame
+- Upgrade path: TrackNet deep learning model if traditional CV is insufficient
 
 ### Player Filtering Strategy
 - Run court polygon filter on **first ~30 frames only** to identify the 4 real player track IDs
@@ -81,12 +89,16 @@ padeldet/
 │   ├── player_tracker/
 │   │   ├── __init__.py
 │   │   └── player_tracker.py        # YOLO + ByteTrack + court-aware filtering
+│   ├── ball_tracker/
+│   │   ├── __init__.py
+│   │   └── ball_tracker.py         # MOG2 + HSV + linear prediction
 │   └── court/
 │       ├── __init__.py
 │       ├── models.py                # CourtKeypoints, court dimensions
 │       └── projection.py           # Homography, projection, mini-court
 └── scripts/
     ├── evaluate_player_tracking.py  # --court-keypoints support
+    ├── evaluate_ball_tracking.py    # Ball detection eval + trail visualization
     └── calibrate_court.py           # Manual keypoint calibration tool
 ```
 

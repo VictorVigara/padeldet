@@ -180,6 +180,26 @@ class FrameDetections:
         return frame
 
 
+BALL_CLASS_ID = 1
+BALL_RADIUS_PX = 5
+
+
+def ball_detection(
+    x: float,
+    y: float,
+    confidence: float,
+    radius: float = BALL_RADIUS_PX,
+) -> TrackedDetection:
+    """Create a TrackedDetection for a ball position."""
+    return TrackedDetection(
+        bbox=BoundingBox(x - radius, y - radius, x + radius, y + radius),
+        confidence=confidence,
+        class_id=BALL_CLASS_ID,
+        label="ball",
+        track_id=0,
+    )
+
+
 def save_detections(detections: list[FrameDetections], path: str | Path) -> None:
     """Save a list of FrameDetections to JSON."""
     data = [fd.serialize() for fd in detections]
