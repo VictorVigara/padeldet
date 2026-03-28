@@ -42,7 +42,18 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 ### Concrete Trackers (each in its own folder)
 - `padeldet/player_tracker/` — YOLO + ByteTrack (implemented)
 - `padeldet/ball_tracker/` — future
-- `padeldet/court_detector/` — future
+
+### Court Module (`padeldet/court/`)
+- **Not a Tracker** — court detection is static, not a tracking problem
+- `models.py` — `CourtKeypoints` dataclass (12-point schema), court dimensions in meters, `COURT_KEYPOINTS_2D` reference coords
+- `projection.py` — `CourtProjection` (homography via `cv2.findHomography`), point projection, court polygon check, `draw_mini_court()` overlay
+- Supports partial keypoints (some can be None/skipped), needs ≥4 for homography
+- Manual calibration via `scripts/calibrate_court.py`, auto-detection can be added later
+
+### Player Filtering Strategy
+- Run court polygon filter on **first ~30 frames only** to identify the 4 real player track IDs
+- Then filter the entire video to keep only those IDs
+- Falls back to top-4-by-confidence when no court info is provided
 
 ### Video I/O (`padeldet/video.py`)
 - `VideoInfo` dataclass + `frame_generator()` using OpenCV
@@ -67,11 +78,16 @@ padeldet/
 │   ├── models.py                    # Shared data models
 │   ├── base.py                      # Tracker ABC
 │   ├── video.py                     # Video I/O
-│   └── player_tracker/
+│   ├── player_tracker/
+│   │   ├── __init__.py
+│   │   └── player_tracker.py        # YOLO + ByteTrack + court-aware filtering
+│   └── court/
 │       ├── __init__.py
-│       └── player_tracker.py        # YOLO + ByteTrack
+│       ├── models.py                # CourtKeypoints, court dimensions
+│       └── projection.py           # Homography, projection, mini-court
 └── scripts/
-    └── evaluate_player_tracking.py
+    ├── evaluate_player_tracking.py  # --court-keypoints support
+    └── calibrate_court.py           # Manual keypoint calibration tool
 ```
 
 ## Tech Stack

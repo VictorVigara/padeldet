@@ -3,6 +3,7 @@ Quick evaluation script for player detection and tracking.
 
 Usage:
     python scripts/evaluate_player_tracking.py --video path/to/video.mp4
+    python scripts/evaluate_player_tracking.py --video path/to/video.mp4 --court-keypoints court_keypoints.json
     python scripts/evaluate_player_tracking.py --video path/to/video.mp4 --model yolov8m.pt --output results.mp4
 """
 
@@ -13,6 +14,8 @@ from pathlib import Path
 # Add project root to path so we can import padeldet
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from padeldet.court.models import CourtKeypoints
+from padeldet.court.projection import CourtProjection, draw_mini_court
 from padeldet.models import save_detections
 from padeldet.player_tracker import PlayerTracker, PlayerTrackerConfig
 from padeldet.video import VideoInfo, VideoWriter, frame_generator
@@ -28,10 +31,11 @@ def parse_args():
     parser.add_argument("--save-json", default=None, help="Save detections to JSON")
     parser.add_argument("--start", type=int, default=0, help="Start frame")
     parser.add_argument("--end", type=int, default=None, help="End frame")
+    parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON (from calibrate_court.py)")
     return parser.parse_args()
 
 
-def print_stats(results):
+def print_stats(results, court_projection=None):
     """Print detection statistics."""
     counts = [len(fd) for fd in results]
     confidences = [
@@ -70,6 +74,21 @@ def print_stats(results):
     print(f"\nUnique track IDs seen: {len(all_ids)} (ideal: 4)")
     if all_ids:
         print(f"  IDs: {sorted(all_ids)}")
+
+    # Court projection stats
+    if court_projection is not None:
+        print("\nCourt-projected positions (meters):")
+        for tid in sorted(all_ids):
+            xs, ys = [], []
+            for fd in results:
+                for d in fd.detections:
+                    if d.track_id == tid:
+                        cx, cy = court_projection.project_detection(d)
+                        xs.append(cx)
+                        ys.append(cy)
+            if xs:
+                print(f"  Player #{tid}: x=[{min(xs):.1f}, {max(xs):.1f}] y=[{min(ys):.1f}, {max(ys):.1f}]")
+
     print("=" * 50)
 
 
@@ -83,15 +102,26 @@ def main():
     print(f"  FPS: {video_info.fps}")
     print(f"  Frames: {video_info.total_frames}")
 
+    # Load court keypoints if provided
+    court_projection = None
+    if args.court_keypoints:
+        keypoints = CourtKeypoints.load(args.court_keypoints)
+        court_projection = CourtProjection(keypoints)
+        print(f"\nCourt keypoints loaded: {keypoints.num_available}/12 points")
+
     # Set up tracker
     config = PlayerTrackerConfig(
         model_path=args.model,
         confidence=args.confidence,
         batch_size=args.batch_size,
     )
-    tracker = PlayerTracker(config=config, video_info=video_info)
+    tracker = PlayerTracker(
+        config=config,
+        video_info=video_info,
+        court_projection=court_projection,
+    )
     tracker.to(tracker.device)
-    print(f"\nRunning on: {tracker.device}")
+    print(f"Running on: {tracker.device}")
 
     # Run detection + tracking
     print("\n--- Detection + Tracking ---")
@@ -99,7 +129,7 @@ def main():
     results = tracker.run(frames, start_frame=args.start)
 
     # Print stats
-    print_stats(results)
+    print_stats(results, court_projection)
 
     # Save annotated video
     print(f"\nWriting annotated video to: {args.output}")
@@ -109,6 +139,8 @@ def main():
             frame_generator(video_path, start=args.start, end=args.end),
         ):
             annotated = fd.draw(frame)
+            if court_projection is not None:
+                annotated = draw_mini_court(annotated, court_projection, fd)
             writer.write(annotated)
     print("Done.")
 

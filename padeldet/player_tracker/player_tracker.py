@@ -12,6 +12,7 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from ..base import Tracker
+from ..court.projection import CourtProjection
 from ..models import BoundingBox, FrameDetections, TrackedDetection
 from ..video import VideoInfo
 
@@ -26,21 +27,28 @@ class PlayerTrackerConfig:
     imgsz: int = 640
     batch_size: int = 8
     person_class_id: int = 0  # COCO person class
+    max_players: int = 4
 
 
 class PlayerTracker(Tracker):
     """
     Detects and tracks players using YOLO for detection
     and ByteTrack for multi-object tracking.
+
+    If a CourtProjection is provided, filters detections to only
+    players inside the court polygon. Otherwise falls back to
+    keeping the top-N by confidence.
     """
 
     def __init__(
         self,
         config: PlayerTrackerConfig | None = None,
         video_info: VideoInfo | None = None,
+        court_projection: CourtProjection | None = None,
     ):
         super().__init__(video_info=video_info)
         self.config = config or PlayerTrackerConfig()
+        self.court_projection = court_projection
         self.model = YOLO(self.config.model_path)
         self._init_byte_track()
 
@@ -88,6 +96,48 @@ class PlayerTracker(Tracker):
             tracked.append(det)
 
         return FrameDetections(frame_index=frame_index, detections=tracked)
+
+    def _identify_player_ids(
+        self, results: list[FrameDetections], num_frames: int = 30
+    ) -> set[int]:
+        """Identify real player track IDs from the first N frames.
+
+        Uses court polygon to find detections inside the court during the
+        initial frames (when players are standing normally), then returns
+        the most frequent track IDs.
+        """
+        from collections import Counter
+
+        id_counts: Counter[int] = Counter()
+        frames_to_check = min(num_frames, len(results))
+
+        for fd in results[:frames_to_check]:
+            for det in fd.detections:
+                if det.track_id is None:
+                    continue
+                if self.court_projection is not None:
+                    if self.court_projection.is_inside_court_px(det.bbox.bottom_center):
+                        id_counts[det.track_id] += 1
+                else:
+                    id_counts[det.track_id] += 1
+
+        # Take the top max_players most frequent IDs
+        player_ids = {
+            tid for tid, _ in id_counts.most_common(self.config.max_players)
+        }
+        return player_ids
+
+    def _filter_by_ids(
+        self, results: list[FrameDetections], player_ids: set[int]
+    ) -> list[FrameDetections]:
+        """Keep only detections whose track_id is in the player set."""
+        filtered = []
+        for fd in results:
+            kept = [d for d in fd.detections if d.track_id in player_ids]
+            filtered.append(
+                FrameDetections(frame_index=fd.frame_index, detections=kept)
+            )
+        return filtered
 
     def detect_and_track(
         self,
@@ -138,5 +188,11 @@ class PlayerTracker(Tracker):
             )
             for idx, result in zip(batch_indices, results):
                 all_results.append(self._process_result(result, idx))
+
+        # Identify real player IDs from initial frames, then filter
+        if self.court_projection is not None or len(all_results) > 0:
+            player_ids = self._identify_player_ids(all_results)
+            if player_ids:
+                all_results = self._filter_by_ids(all_results, player_ids)
 
         return all_results
