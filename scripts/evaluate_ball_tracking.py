@@ -26,10 +26,10 @@ from padeldet.video import VideoInfo, VideoWriter, frame_generator
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate ball detection and tracking")
-    parser.add_argument("--video", required=True, help="Input video path")
-    parser.add_argument("--tracknet-weights", required=True, help="TrackNet model weights path")
-    parser.add_argument("--inpaintnet-weights", default="", help="InpaintNet model weights path (optional)")
-    parser.add_argument("--output", default="ball_tracking_output.mp4", help="Output video path")
+    parser.add_argument("--video", default="/home/vvipu/padel_analytics/examples/videos/rally.mp4", help="Input video path")
+    parser.add_argument("--tracknet-weights", default="/home/vvipu/padel_analytics/weights/ball_detection/TrackNet_best.pt", help="TrackNet model weights path")
+    parser.add_argument("--inpaintnet-weights", default="/home/vvipu/padel_analytics/weights/ball_detection/InpaintNet_best.pt", help="InpaintNet model weights path (optional)")
+    parser.add_argument("--output", default="ball_tracking_output_debug.mp4", help="Output video path")
     parser.add_argument("--save-json", default=None, help="Save detections to JSON")
     parser.add_argument("--start", type=int, default=0, help="Start frame")
     parser.add_argument("--end", type=int, default=None, help="End frame")
@@ -37,6 +37,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=8, help="TrackNet batch size")
     parser.add_argument("--player-json", default=None, help="Load player detections to overlay")
     parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON")
+    parser.add_argument("--debug", default=False, action="store_true", help="Show each frame interactively (any key=next, q=quit)")
     return parser.parse_args()
 
 
@@ -178,6 +179,7 @@ def main():
         tracknet_weights=args.tracknet_weights,
         inpaintnet_weights=args.inpaintnet_weights,
         batch_size=args.batch_size,
+        debug=args.debug,
     )
     tracker = BallTracker(config=config, video_info=video_info)
     print(f"\nTrackNet loaded, batch_size={config.batch_size}")

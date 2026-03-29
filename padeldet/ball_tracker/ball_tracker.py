@@ -10,7 +10,9 @@ The pipeline:
   3. For each window: resize to 288x512, concat median, run TrackNet
   4. Temporal ensemble: average overlapping predictions for robustness
   5. Extract ball coordinates from heatmaps via contour detection
-  6. Optionally run InpaintNet to fill gaps in predictions
+  6. Post-processing: outlier rejection + temporal isolation filtering
+  7. Optionally run InpaintNet to fill gaps in predictions
+  8. Savitzky-Golay smoothing for micro-jitter removal
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
+from scipy.signal import savgol_filter
 from tqdm import tqdm
 
 from ..base import Tracker
@@ -46,6 +49,12 @@ class BallTrackerConfig:
     seq_len: int = 8  # TrackNet input sequence length
     median_sample_frames: int = 300  # frames to sample for median background
     heatmap_threshold: float = 0.5
+    # Post-processing
+    outlier_mad_factor: float = 6.0  # reject displacements > median + factor * MAD
+    min_consecutive: int = 3  # min consecutive detections to keep (temporal isolation)
+    smooth_window: int = 5  # Savitzky-Golay window (odd, 0 to disable)
+    smooth_polyorder: int = 2  # Savitzky-Golay polynomial order
+    debug: bool = False  # show live frame-by-frame debug visualization
 
 
 def _load_tracknet(weights_path: str, device: str) -> tuple[TrackNet, int, str]:
@@ -176,6 +185,231 @@ def _generate_inpaint_mask(
         i = j
 
     return mask.tolist()
+
+
+def _reject_outliers(
+    xs: list[float],
+    ys: list[float],
+    vis: list[int],
+    mad_factor: float = 6.0,
+) -> tuple[list[float], list[float], list[int]]:
+    """Reject detections with physically impossible displacements.
+
+    Uses median + mad_factor * MAD of per-frame displacements as threshold.
+    Accounts for gap length: if a ball was invisible for N frames, the allowed
+    displacement is N * threshold.
+    """
+    xs, ys, vis = list(xs), list(ys), list(vis)
+    n = len(xs)
+    if n < 2:
+        return xs, ys, vis
+
+    # Compute per-frame displacements between consecutive visible frames
+    displacements: list[float] = []
+    prev_idx: int | None = None
+    for i in range(n):
+        if vis[i] == 1:
+            if prev_idx is not None:
+                gap = i - prev_idx
+                dx = xs[i] - xs[prev_idx]
+                dy = ys[i] - ys[prev_idx]
+                dist_per_frame = math.sqrt(dx * dx + dy * dy) / gap
+                displacements.append(dist_per_frame)
+            prev_idx = i
+
+    if len(displacements) < 5:
+        return xs, ys, vis
+
+    med = float(np.median(displacements))
+    mad = float(np.median(np.abs(np.array(displacements) - med)))
+    # Avoid zero MAD (all displacements identical) — use median as floor
+    mad = max(mad, med * 0.1, 1.0)
+    threshold = med + mad_factor * mad
+
+    # Second pass: reject outliers
+    rejected = 0
+    prev_idx = None
+    for i in range(n):
+        if vis[i] == 1:
+            if prev_idx is not None:
+                gap = i - prev_idx
+                dx = xs[i] - xs[prev_idx]
+                dy = ys[i] - ys[prev_idx]
+                dist_per_frame = math.sqrt(dx * dx + dy * dy) / gap
+                if dist_per_frame > threshold:
+                    # Mark current as outlier (keep previous, it was validated)
+                    vis[i] = 0
+                    xs[i] = 0.0
+                    ys[i] = 0.0
+                    rejected += 1
+                    continue
+            prev_idx = i
+
+    if rejected > 0:
+        print(f"Outlier rejection: removed {rejected} detections "
+              f"(threshold: {threshold:.1f} px/frame, median: {med:.1f}, MAD: {mad:.1f})")
+
+    return xs, ys, vis
+
+
+def _reject_isolated(
+    xs: list[float],
+    ys: list[float],
+    vis: list[int],
+    min_consecutive: int = 3,
+) -> tuple[list[float], list[float], list[int]]:
+    """Reject isolated detections shorter than min_consecutive frames.
+
+    A single bright pixel or glass reflection that triggers a detection for
+    1-2 frames is almost certainly noise.
+    """
+    xs, ys, vis = list(xs), list(ys), list(vis)
+    n = len(xs)
+    rejected = 0
+
+    i = 0
+    while i < n:
+        if vis[i] == 0:
+            i += 1
+            continue
+        # Find end of consecutive visible stretch
+        j = i
+        while j < n and vis[j] == 1:
+            j += 1
+        length = j - i
+        if length < min_consecutive:
+            for k in range(i, j):
+                vis[k] = 0
+                xs[k] = 0.0
+                ys[k] = 0.0
+                rejected += 1
+        i = j
+
+    if rejected > 0:
+        print(f"Temporal isolation: removed {rejected} detections "
+              f"(min consecutive: {min_consecutive})")
+
+    return xs, ys, vis
+
+
+def _smooth_trajectory(
+    xs: list[float],
+    ys: list[float],
+    vis: list[int],
+    window: int = 5,
+    polyorder: int = 2,
+) -> tuple[list[float], list[float], list[int]]:
+    """Apply Savitzky-Golay smoothing to continuous visible segments."""
+    if window < 3 or window % 2 == 0:
+        return xs, ys, vis
+
+    xs, ys = list(xs), list(ys)
+    n = len(xs)
+
+    # Find continuous visible segments and smooth each independently
+    i = 0
+    while i < n:
+        if vis[i] == 0:
+            i += 1
+            continue
+        j = i
+        while j < n and vis[j] == 1:
+            j += 1
+        seg_len = j - i
+        if seg_len >= window:
+            seg_x = np.array(xs[i:j])
+            seg_y = np.array(ys[i:j])
+            xs[i:j] = savgol_filter(seg_x, window, polyorder).tolist()
+            ys[i:j] = savgol_filter(seg_y, window, polyorder).tolist()
+        i = j
+
+    return xs, ys, vis
+
+
+def _debug_show(
+    frames: list[np.ndarray],
+    xs: list[float],
+    ys: list[float],
+    vis: list[int],
+    stage_name: str,
+    prev_xs: list[float] | None = None,
+    prev_ys: list[float] | None = None,
+    prev_vis: list[int] | None = None,
+) -> None:
+    """Interactive frame-by-frame debug viewer.
+
+    Shows ball position for the current stage (yellow) and optionally the
+    previous stage (red, dimmer) so you can see what changed.
+    Keys: any=next, b=back, q=quit stage, space=play/pause.
+    """
+    idx = 0
+    playing = False
+    n = min(len(frames), len(xs))
+    print(f"\n[DEBUG] {stage_name} — {n} frames (any=next, b=back, q=skip, space=play)")
+
+    while 0 <= idx < n:
+        frame = frames[idx].copy()
+
+        # Previous stage position (red, smaller)
+        if prev_xs is not None and prev_vis is not None and idx < len(prev_vis):
+            if prev_vis[idx] == 1:
+                px, py = int(prev_xs[idx]), int(prev_ys[idx])
+                cv2.circle(frame, (px, py), 6, (0, 0, 200), 2, cv2.LINE_AA)
+
+        # Current stage position (yellow)
+        has_ball = idx < len(vis) and vis[idx] == 1
+        if has_ball:
+            cx, cy = int(xs[idx]), int(ys[idx])
+            cv2.circle(frame, (cx, cy), 8, (0, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, (cx, cy), 3, (0, 255, 255), -1, cv2.LINE_AA)
+            status = f"BALL ({cx}, {cy})"
+        else:
+            status = "NO BALL"
+
+        # Displacement info
+        disp_text = ""
+        if has_ball:
+            for j in range(idx - 1, -1, -1):
+                if vis[j] == 1:
+                    gap = idx - j
+                    dx = xs[idx] - xs[j]
+                    dy = ys[idx] - ys[j]
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    disp_text = f"disp: {dist:.0f}px (gap={gap}f, {dist / gap:.0f}px/f)"
+                    break
+
+        # Changed marker
+        changed = ""
+        if prev_vis is not None and idx < len(prev_vis):
+            was_ball = prev_vis[idx] == 1
+            if was_ball and not has_ball:
+                changed = " [REMOVED]"
+            elif not was_ball and has_ball:
+                changed = " [ADDED]"
+            elif was_ball and has_ball:
+                dx = xs[idx] - prev_xs[idx]
+                dy = ys[idx] - prev_ys[idx]
+                if math.sqrt(dx * dx + dy * dy) > 1.0:
+                    changed = " [MOVED]"
+
+        cv2.putText(frame, f"[{stage_name}] Frame {idx} | {status}{changed}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        if disp_text:
+            cv2.putText(frame, disp_text,
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+
+        cv2.imshow("Ball Debug", frame)
+        key = cv2.waitKey(30 if playing else 0) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('b'):
+            idx = max(0, idx - 1)
+        elif key == ord(' '):
+            playing = not playing
+        else:
+            idx += 1
+
+    cv2.destroyAllWindows()
 
 
 class BallTracker(Tracker):
@@ -345,11 +579,41 @@ class BallTracker(Tracker):
             # Trim buffer — keep last buffer_size entries for next batch's ensemble
             pred_buffer = pred_buffer[-buffer_size:]
 
-        # Step 3: Optional inpainting
+        # Debug: show raw TrackNet output
+        if self.config.debug:
+            _debug_show(frames_list, xs, ys, vis, "1-RAW TrackNet")
+
+        # Step 3: Post-processing — outlier rejection + temporal isolation
+        if len(xs) > 0:
+            raw_xs, raw_ys, raw_vis = list(xs), list(ys), list(vis)
+            xs, ys, vis = _reject_outliers(xs, ys, vis, self.config.outlier_mad_factor)
+            xs, ys, vis = _reject_isolated(xs, ys, vis, self.config.min_consecutive)
+
+            if self.config.debug:
+                _debug_show(frames_list, xs, ys, vis, "2-After Outlier+Isolation",
+                            raw_xs, raw_ys, raw_vis)
+
+        # Step 4: Optional inpainting (fills gaps including rejected outliers)
         if self.inpaintnet is not None and len(xs) > 0:
+            pre_inpaint_xs, pre_inpaint_ys, pre_inpaint_vis = list(xs), list(ys), list(vis)
             xs, ys, vis = self._run_inpainting(xs, ys, vis, w_scale, h_scale)
 
-        # Step 4: Build FrameDetections
+            if self.config.debug:
+                _debug_show(frames_list, xs, ys, vis, "3-After InpaintNet",
+                            pre_inpaint_xs, pre_inpaint_ys, pre_inpaint_vis)
+
+        # Step 5: Savitzky-Golay smoothing
+        if self.config.smooth_window > 0 and len(xs) > 0:
+            pre_smooth_xs, pre_smooth_ys, pre_smooth_vis = list(xs), list(ys), list(vis)
+            xs, ys, vis = _smooth_trajectory(
+                xs, ys, vis, self.config.smooth_window, self.config.smooth_polyorder
+            )
+
+            if self.config.debug:
+                _debug_show(frames_list, xs, ys, vis, "4-After Smoothing",
+                            pre_smooth_xs, pre_smooth_ys, pre_smooth_vis)
+
+        # Step 6: Build FrameDetections
         results: list[FrameDetections] = []
         for i in range(total):
             if i < len(xs) and vis[i] == 1:

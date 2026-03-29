@@ -109,7 +109,7 @@ class InpaintNet(nn.Module):
         self.down_1 = Conv1DBlock(3, 32)
         self.down_2 = Conv1DBlock(32, 64)
         self.down_3 = Conv1DBlock(64, 128)
-        self.bottleneck = Double1DConv(128, 256)
+        self.buttleneck = Double1DConv(128, 256)  # typo matches pre-trained weights
         self.up_1 = Conv1DBlock(384, 128)
         self.up_2 = Conv1DBlock(192, 64)
         self.up_3 = Conv1DBlock(96, 32)
@@ -122,7 +122,7 @@ class InpaintNet(nn.Module):
         x1 = self.down_1(x)
         x2 = self.down_2(x1)
         x3 = self.down_3(x2)
-        x = self.bottleneck(x3)
+        x = self.buttleneck(x3)
         x = torch.cat([x, x3], dim=1)
         x = self.up_1(x)
         x = torch.cat([x, x2], dim=1)
