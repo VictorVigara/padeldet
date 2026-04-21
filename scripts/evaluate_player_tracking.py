@@ -2,9 +2,9 @@
 Quick evaluation script for player detection and tracking.
 
 Usage:
-    python scripts/evaluate_player_tracking.py --video path/to/video.mp4
-    python scripts/evaluate_player_tracking.py --video path/to/video.mp4 --court-keypoints court_keypoints.json
-    python scripts/evaluate_player_tracking.py --video path/to/video.mp4 --model yolov8m.pt --output results.mp4
+    python scripts/evaluate_player_tracking.py --video data/rally/video.mp4
+    python scripts/evaluate_player_tracking.py --video data/rally/video.mp4 --court-keypoints data/rally/court_keypoints.json
+    python scripts/evaluate_player_tracking.py --video data/rally/video.mp4 --model weights/yolov8m.pt --output data/rally/player_tracking_output.mp4
 """
 
 import argparse
@@ -24,14 +24,17 @@ from padeldet.video import VideoInfo, VideoWriter, frame_generator
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate player detection and tracking")
     parser.add_argument("--video", required=True, help="Input video path")
-    parser.add_argument("--model", default="yolov8m.pt", help="YOLO model path")
+    parser.add_argument("--model", default="weights/yolov8m.pt", help="YOLO model path")
     parser.add_argument("--output", default="player_tracking_output.mp4", help="Output video path")
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--save-json", default=None, help="Save detections to JSON")
     parser.add_argument("--start", type=int, default=0, help="Start frame")
     parser.add_argument("--end", type=int, default=None, help="End frame")
+    parser.add_argument("--detection-fps", type=float, default=None, help="Run detection at this fps (e.g. 10 on a 25fps video → every 2-3 frames)")
     parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON (from calibrate_court.py)")
+    parser.add_argument("--tracker-type", default="deepocsort", choices=["bytetrack", "deepocsort"],
+                        help="Tracking algorithm (default: deepocsort)")
     return parser.parse_args()
 
 
@@ -114,6 +117,7 @@ def main():
         model_path=args.model,
         confidence=args.confidence,
         batch_size=args.batch_size,
+        tracker_type=args.tracker_type,
     )
     tracker = PlayerTracker(
         config=config,
@@ -123,25 +127,37 @@ def main():
     tracker.to(tracker.device)
     print(f"Running on: {tracker.device}")
 
+    # Compute stride from detection fps
+    stride = 1
+    if args.detection_fps:
+        stride = max(1, round(video_info.fps / args.detection_fps))
+        print(f"Detection stride: {stride} (≈{video_info.fps / stride:.1f} fps)")
+
     # Run detection + tracking
     print("\n--- Detection + Tracking ---")
-    frames = frame_generator(video_path, start=args.start, end=args.end)
-    results = tracker.run(frames, start_frame=args.start)
+    frames = frame_generator(video_path, start=args.start, end=args.end, stride=stride)
+    results = tracker.run(frames, start_frame=args.start, stride=stride)
 
     # Print stats
     print_stats(results, court_projection)
 
     # Save annotated video
     print(f"\nWriting annotated video to: {args.output}")
+    frame_lookup = {fd.frame_index: fd for fd in results}
+    last_fd = None
+    abs_idx = args.start
     with VideoWriter(args.output, video_info) as writer:
-        for fd, frame in zip(
-            results,
-            frame_generator(video_path, start=args.start, end=args.end),
-        ):
-            annotated = fd.draw(frame)
-            if court_projection is not None:
-                annotated = draw_mini_court(annotated, court_projection, fd)
+        for frame in frame_generator(video_path, start=args.start, end=args.end):
+            if abs_idx in frame_lookup:
+                last_fd = frame_lookup[abs_idx]
+            if last_fd is not None:
+                annotated = last_fd.draw(frame)
+                if court_projection is not None:
+                    annotated = draw_mini_court(annotated, court_projection, last_fd)
+            else:
+                annotated = frame
             writer.write(annotated)
+            abs_idx += 1
     print("Done.")
 
     # Optionally save JSON

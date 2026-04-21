@@ -1,5 +1,9 @@
 # Model weights
+weights/
 *.pt
+
+# Evaluation data (videos, detections, outputs)
+data/
 
 # Output videos
 *.mp4

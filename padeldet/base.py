@@ -49,6 +49,7 @@ class Tracker(ABC):
         self,
         frames: Iterator[np.ndarray],
         start_frame: int = 0,
+        stride: int = 1,
     ) -> list[FrameDetections]:
         """
         Run detection and tracking on a sequence of frames.
@@ -56,6 +57,9 @@ class Tracker(ABC):
         Args:
             frames: iterator of BGR frames
             start_frame: frame index offset for the first frame
+            stride: step between consecutive frames in the original video.
+                    Used to assign correct frame_index values when frames
+                    were sampled with frame_generator(..., stride=stride).
 
         Returns:
             list of FrameDetections, one per input frame
@@ -71,9 +75,10 @@ class Tracker(ABC):
         self,
         frames: Iterator[np.ndarray],
         start_frame: int = 0,
+        stride: int = 1,
     ) -> list[FrameDetections]:
         """Run detection+tracking and store results."""
-        self._results = self.detect_and_track(frames, start_frame)
+        self._results = self.detect_and_track(frames, start_frame, stride)
         return self._results
 
     def save_results(self, path: str | Path) -> None:
