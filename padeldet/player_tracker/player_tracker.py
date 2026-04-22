@@ -28,12 +28,14 @@ class PlayerTrackerConfig:
     batch_size: int = 8
     person_class_id: int = 0  # COCO person class
     max_players: int = 10
+    # Warm-up player lock
+    warmup_duration_sec: float = 60.0
     # Tracker selection
     tracker_type: Literal["bytetrack", "deepocsort"] = "deepocsort"
     # DeepOCSORT-specific
     reid_weights: str = "weights/osnet_x0_25_msmt17.pt"
     fp16: bool = True        # auto-forced False on CPU
-    tracker_max_age: int = 30    # frames before a lost track is dropped (Task 3 handles drink breaks separately)
+    tracker_max_age: int = 200    # frames before a lost track is dropped (Task 3 handles drink breaks separately)
     tracker_min_hits: int = 1
 
 
@@ -189,33 +191,95 @@ class PlayerTracker(Tracker):
     # ------------------------------------------------------------------
 
     def _identify_player_ids(
-        self, results: list[FrameDetections], num_frames: int = 30
+        self, results: list[FrameDetections], warmup_frames: int
     ) -> set[int]:
-        """Identify real player track IDs from the first N frames.
+        """Identify the 4 real player track IDs from the warm-up window.
 
-        Uses court polygon to find detections inside the court during the
-        initial frames (when players are standing normally), then returns
-        the most frequent track IDs.
+        With court projection: score = in_court_ratio * mean_depth, where
+        mean_depth is the average distance (meters) to the nearest court line
+        for in-court frames. This discriminates real players (deep inside) from
+        boundary spectators (always near the glass wall, score → 0).
+
+        Without court projection: falls back to raw detection frequency.
+        Stores per-track metrics in self.warmup_metrics for inspection/plotting.
         """
-        from collections import Counter
+        import logging
+        from collections import defaultdict
 
-        id_counts: Counter[int] = Counter()
-        frames_to_check = min(num_frames, len(results))
+        from ..court.models import COURT_LENGTH, COURT_WIDTH
 
-        for fd in results[:frames_to_check]:
+        seen: dict[int, int] = defaultdict(int)
+        in_court: dict[int, int] = defaultdict(int)
+        depth_sum: dict[int, float] = defaultdict(float)
+
+        for fd in results[:warmup_frames]:
             for det in fd.detections:
                 if det.track_id is None:
                     continue
+                tid = det.track_id
+                seen[tid] += 1
                 if self.court_projection is not None:
-                    if self.court_projection.is_inside_court_px(det.bbox.bottom_center):
-                        id_counts[det.track_id] += 1
+                    x_m, y_m = self.court_projection.project_detection(det)
+                    if 0 <= x_m <= COURT_WIDTH and 0 <= y_m <= COURT_LENGTH:
+                        depth = min(x_m, COURT_WIDTH - x_m, y_m, COURT_LENGTH - y_m)
+                        in_court[tid] += 1
+                        depth_sum[tid] += depth
                 else:
-                    id_counts[det.track_id] += 1
+                    in_court[tid] += 1
 
-        player_ids = {
-            tid for tid, _ in id_counts.most_common(self.config.max_players)
-        }
-        return player_ids
+        if self.court_projection is not None:
+            scores = {
+                tid: (in_court[tid] / seen[tid]) * (depth_sum[tid] / in_court[tid])
+                if in_court[tid] > 0 else 0.0
+                for tid in seen
+            }
+        else:
+            scores = {tid: float(seen[tid]) for tid in seen}
+
+        ranked = sorted(scores, key=lambda t: scores[t], reverse=True)
+        locked = set(ranked[:4])
+
+        if len(ranked) < 4:
+            logging.warning(
+                f"Only {len(ranked)} tracks found in warm-up window "
+                f"({warmup_frames} frames). Expected 4. "
+                "Check court keypoints and video content."
+            )
+
+        # Build metrics dict for external inspection / plotting
+        self.warmup_metrics: dict[int, dict] = {}
+        for tid in ranked:
+            ratio = in_court[tid] / seen[tid] if seen[tid] > 0 else 0.0
+            mean_depth = depth_sum[tid] / in_court[tid] if in_court[tid] > 0 else 0.0
+            self.warmup_metrics[tid] = {
+                "seen": seen[tid],
+                "in_court": in_court[tid],
+                "ratio": ratio,
+                "mean_depth_m": mean_depth,
+                "score": scores[tid],
+                "locked": tid in locked,
+            }
+
+        # Print summary table
+        has_court = self.court_projection is not None
+        header = (
+            f"\n{'ID':>4}  {'seen':>6}  {'in-court':>8}  {'ratio':>6}"
+            + (f"  {'depth(m)':>8}  {'score':>6}" if has_court else "")
+            + f"  status"
+        )
+        print(f"\nWarm-up lock ({warmup_frames} frames):{header}")
+        print("  " + "-" * (len(header) - 1))
+        for tid in ranked:
+            m = self.warmup_metrics[tid]
+            row = (
+                f"{tid:>4}  {m['seen']:>6}  {m['in_court']:>8}  {m['ratio']:>6.2f}"
+                + (f"  {m['mean_depth_m']:>8.2f}  {m['score']:>6.2f}" if has_court else "")
+                + f"  {'LOCKED' if m['locked'] else 'duplicate'}"
+            )
+            print(f"  {row}")
+        print()
+
+        return locked
 
     def _filter_by_ids(
         self, results: list[FrameDetections], player_ids: set[int]
@@ -284,9 +348,13 @@ class PlayerTracker(Tracker):
             for idx, result, bgr in zip(batch_indices, results, batch_bgr):
                 all_results.append(self._process_result(result, idx, bgr))
 
-        # Identify real player IDs from initial frames, then filter
-        if self.court_projection is not None or len(all_results) > 0:
-            player_ids = self._identify_player_ids(all_results)
+        # Identify real player IDs from warm-up window, then filter
+        if len(all_results) > 0:
+            fps = self.video_info.fps if self.video_info else 30.0
+            warmup_frames = int(self.config.warmup_duration_sec * fps)
+            warmup_frames = max(30, min(warmup_frames, len(all_results)))
+            self.warmup_frames_used = warmup_frames
+            player_ids = self._identify_player_ids(all_results, warmup_frames)
             if player_ids:
                 all_results = self._filter_by_ids(all_results, player_ids)
 

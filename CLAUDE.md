@@ -40,7 +40,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - Each tracker type lives in its own subdirectory
 
 ### Concrete Trackers (each in its own folder)
-- `padeldet/player_tracker/` — YOLO + ByteTrack (implemented)
+- `padeldet/player_tracker/` — YOLO + DeepOCSORT (OSNet ReID) + warm-up player lock
 - `padeldet/ball_tracker/` — MOG2 background subtraction + HSV color + linear motion prediction
 
 ### Court Module (`padeldet/court/`)
@@ -51,17 +51,33 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - Manual calibration via `scripts/calibrate_court.py`, auto-detection can be added later
 
 ### Ball Tracker (`padeldet/ball_tracker/`)
-- `BallTrackerConfig` — HSV range, contour area limits, MOG2 params, search radius, max lost frames
-- `BallTracker` — implements Tracker ABC, pure OpenCV (no GPU)
-- Detection state machine: init mode (MOG2+HSV, pick smallest blob) -> tracking mode (linear prediction + nearest blob) -> color fallback -> lost
+- `BallTrackerConfig` — TrackNet weights, InpaintNet weights, batch size, post-processing params
+- `BallTracker` — implements Tracker ABC, TrackNet U-Net CNN with temporal ensemble
+- Pipeline: median background → sliding 8-frame windows → TrackNet heatmaps → temporal ensemble → outlier rejection (adaptive MAD) → temporal isolation → InpaintNet gap-filling → Savitzky-Golay smoothing
 - Ball represented as `TrackedDetection` with synthetic small bbox via `ball_detection()` helper in `models.py`
 - `confidence=0.0` means ball not visible in that frame
-- Upgrade path: TrackNet deep learning model if traditional CV is insufficient
+- Debug mode (`config.debug=True`) shows interactive frame-by-frame visualization at each pipeline stage
+- Pre-trained weights: `TrackNet_best.pt` and `InpaintNet_best.pt`
 
-### Player Filtering Strategy
-- Run court polygon filter on **first ~30 frames only** to identify the 4 real player track IDs
-- Then filter the entire video to keep only those IDs
-- Falls back to top-4-by-confidence when no court info is provided
+### Metrics Module (`padeldet/metrics/`)
+- **Offline computation** from saved player detection JSON + court keypoints
+- `compute_metrics(detections, projection, fps)` → `MatchMetrics`
+- **Position pipeline**: project to court meters → interpolate short gaps → Savitzky-Golay smoothing
+- **Team assignment**: median Y over first 30 frames, split near/far at net (10m)
+- **Per-player metrics**: distance covered, speed (avg/max/distribution), zone time (net/transition/back), net approaches, position heatmap
+- **Per-team metrics**: formation classification (both-at-net, both-at-back, one-up-one-back)
+- Zone boundaries relative to team side: net=0-3m from baseline, transition=3-7m, back=7-10m
+- Speed categories: stationary (<0.5 m/s), walking (0.5-2), jogging (2-4), sprinting (>4)
+- JSON serialization via `MatchMetrics.save()`/`load()`
+
+### Player Filtering Strategy (Sprint 3 Task 2)
+- **Warm-up window** (default 60 s, configurable via `warmup_duration_sec`): observe all tracks, accumulate `in_court_ratio` and `mean_depth_m` (average distance to nearest court line in meters)
+- **Score** = `in_court_ratio × mean_depth_m` — ranks real players (deep inside) above boundary spectators (near glass wall, depth ≈ 0)
+- After warm-up: lock the top-4 by score as `locked_player_ids`; log extras as `suspected_duplicate`
+- Filter entire video to keep only those 4 IDs
+- Without court projection: falls back to raw detection frequency
+- `tracker.warmup_metrics` dict (tid → ratio/depth/score/locked) available after tracking for inspection
+- `tracker.warmup_frames_used` stores the actual frame count used for the warm-up window
 
 ### Video I/O (`padeldet/video.py`)
 - `VideoInfo` dataclass + `frame_generator()` using OpenCV
@@ -91,7 +107,15 @@ padeldet/
 │   │   └── player_tracker.py        # YOLO + ByteTrack + court-aware filtering
 │   ├── ball_tracker/
 │   │   ├── __init__.py
-│   │   └── ball_tracker.py         # MOG2 + HSV + linear prediction
+│   │   ├── ball_tracker.py          # TrackNet + ensemble + post-processing
+│   │   └── models.py                # TrackNet, InpaintNet architectures
+│   ├── metrics/
+│   │   ├── __init__.py
+│   │   ├── models.py                # PlayerTrack, MatchMetrics, enums
+│   │   ├── positions.py             # Projection, interpolation, smoothing, teams
+│   │   ├── zones.py                 # Zone classification, formations, heatmaps
+│   │   ├── movement.py              # Distance, speed, speed distribution
+│   │   └── compute.py               # MetricsConfig, compute_metrics()
 │   └── court/
 │       ├── __init__.py
 │       ├── models.py                # CourtKeypoints, court dimensions
@@ -99,7 +123,8 @@ padeldet/
 └── scripts/
     ├── evaluate_player_tracking.py  # --court-keypoints support
     ├── evaluate_ball_tracking.py    # Ball detection eval + trail visualization
-    └── calibrate_court.py           # Manual keypoint calibration tool
+    ├── evaluate_metrics.py          # Player metrics computation + heatmap plots
+    └─��� calibrate_court.py           # Manual keypoint calibration tool
 ```
 
 ## Tech Stack
@@ -109,6 +134,7 @@ padeldet/
 - supervision for tracking (ByteTrack) and visualization
 - OpenCV for video I/O
 - PyTorch as ML backend
+- scipy for signal processing (smoothing filters)
 
 ## Reference
 
@@ -118,6 +144,6 @@ padeldet/
 ## Development Notes
 
 - Always discuss structural decisions with user before creating new modules
-- Focus on detection/tracking first, metrics come later
+- Detection/tracking done; metrics module implemented for positioning and movement
 - Server/API concerns are premature — build clean data models now, wrap in API later
 - **Commit and push when a feature works** — keep the remote up to date with working increments

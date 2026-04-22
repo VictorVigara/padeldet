@@ -25,7 +25,7 @@
 
 ---
 
-### Task 2 — 4-player hard prior + court-region gating
+### Task 2 — 4-player hard prior + court-region gating ✅
 
 **Files:** `pipeline/player_tracker.py`
 
