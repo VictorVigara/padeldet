@@ -72,20 +72,30 @@ class TrackedDetection(Detection):
     """Detection with a persistent track ID across frames."""
 
     track_id: int | None = None
+    court_position: tuple[float, float] | None = None
+    logical_player_id: int | None = None
+    visible: bool = True
 
     def serialize(self) -> dict:
         data = super().serialize()
         data["track_id"] = self.track_id
+        data["court_position"] = list(self.court_position) if self.court_position is not None else None
+        data["logical_player_id"] = self.logical_player_id
+        data["visible"] = self.visible
         return data
 
     @classmethod
     def from_dict(cls, d: dict) -> TrackedDetection:
+        cp = d.get("court_position")
         return cls(
             bbox=BoundingBox(*d["bbox"]),
             confidence=d["confidence"],
             class_id=d["class_id"],
             label=d.get("label", ""),
             track_id=d.get("track_id"),
+            court_position=tuple(cp) if cp is not None else None,
+            logical_player_id=d.get("logical_player_id"),
+            visible=d.get("visible", True),
         )
 
 
@@ -168,8 +178,11 @@ class FrameDetections:
         labels = []
         for det in self.detections:
             parts = []
-            if show_track_id and det.track_id is not None:
-                parts.append(f"#{det.track_id}")
+            if show_track_id:
+                if det.logical_player_id is not None:
+                    parts.append(f"P{det.logical_player_id}")
+                elif det.track_id is not None:
+                    parts.append(f"#{det.track_id}")
             if show_confidence:
                 parts.append(f"{det.confidence:.2f}")
             labels.append(" ".join(parts))
