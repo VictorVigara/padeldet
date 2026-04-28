@@ -20,6 +20,27 @@ from ..video import VideoInfo
 
 
 # ---------------------------------------------------------------------------
+# IoU helper
+# ---------------------------------------------------------------------------
+
+def _box_iou(box_a: list[float], boxes_b: np.ndarray) -> np.ndarray:
+    """IoU between one box [x1,y1,x2,y2] and array of boxes (N,4)."""
+    ax1, ay1, ax2, ay2 = box_a
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ix1 = np.maximum(ax1, boxes_b[:, 0])
+    iy1 = np.maximum(ay1, boxes_b[:, 1])
+    ix2 = np.minimum(ax2, boxes_b[:, 2])
+    iy2 = np.minimum(ay2, boxes_b[:, 3])
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+    area_b = (
+        np.maximum(0.0, boxes_b[:, 2] - boxes_b[:, 0])
+        * np.maximum(0.0, boxes_b[:, 3] - boxes_b[:, 1])
+    )
+    union = area_a + area_b - inter
+    return np.where(union > 0, inter / union, 0.0)
+
+
+# ---------------------------------------------------------------------------
 # Court-structure helpers (used by LogicalPlayerManager)
 # ---------------------------------------------------------------------------
 
@@ -70,7 +91,7 @@ def _court_depth(court_position: np.ndarray) -> float:
 class PlayerTrackerConfig:
     """Configuration for player detection and tracking."""
 
-    model_path: str = "yolov8m.pt"
+    model_path: Literal["yolov8m.pt", "yolo26m.pt"] = "yolo26m.pt"
     confidence: float = 0.1
     iou_threshold: float = 0.1
     imgsz: int = 960
@@ -78,13 +99,14 @@ class PlayerTrackerConfig:
     person_class_id: int = 0  # COCO person class
     max_players: int = 10
     # Seconds of video to process before pausing for manual player selection
-    selection_window_sec: float = 3.0
+    selection_window_sec: float = 10.0
     # Tracker selection
     tracker_type: Literal["bytetrack", "deepocsort"] = "deepocsort"
     # DeepOCSORT-specific
     reid_weights: str = "weights/osnet_x0_25_msmt17.pt"
     fp16: bool = True
-    tracker_max_age: int = 60
+    # How long (seconds) to keep a track alive without a detection match.
+    tracker_max_age_sec: float = 2.0
     tracker_min_hits: int = 1
 
     # Court / detection box filtering
@@ -94,6 +116,14 @@ class PlayerTrackerConfig:
     max_box_aspect_ratio: float = 6.0
     min_box_aspect_ratio: float = 0.8
 
+    # Pose model for ankle midpoint extraction (opt-in)
+    pose_model_path: str | None = None
+    pose_confidence: float = 0.0001
+    left_foot_kp_idx: int = 15   # COCO left ankle
+    right_foot_kp_idx: int = 16  # COCO right ankle
+    min_keypoint_conf: float = 0.1
+    pose_iou_threshold: float = 0.3
+
     # Logical identity / occlusion recovery
     # Not used for assignment gating — kept for backwards compatibility
     max_missing_frames: int = 90
@@ -102,10 +132,14 @@ class PlayerTrackerConfig:
     # Minimum distance from any court edge (m) for a direct track_id match to be trusted.
     # Detections closer than this are likely spectators near the boundary and will not be
     # accepted as a direct match — they fall through to structural reassignment instead.
-    min_direct_match_court_depth_m: float = 0.1
+    min_direct_match_court_depth_m: float = 0.05
+    proximity_max_distance_m: float = 3.0
 
     # Selection frame scoring
     selection_require_in_court: bool = True
+    # When True and court_projection is available: use depth-based auto-selection (no UI).
+    # When False: fall back to manual PlayerSelectorUI click.
+    auto_select_players: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -176,21 +210,14 @@ class LogicalPlayerManager:
         matched_lids: set[int] = set()
 
         # Step 1: direct track_id matching
-        # Skip if the detection is too close to a court edge — the tracker may have
-        # reassigned a lost player's ID to a spectator near the court boundary.
+        # Trust DeepOCSORT's ReID here unconditionally — if the same track_id comes
+        # back, the tracker has visual evidence it's the same person. The court-edge
+        # depth filter only applies in Steps 2-5, where we're blindly assigning a
+        # new track_id to a logical player by position/role.
         min_depth = self.config.min_direct_match_court_depth_m
         for state in self.states:
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
-                if det.court_position is not None:
-                    depth = _court_depth(np.array(det.court_position, dtype=float))
-                    if depth < min_depth:
-                        logging.debug(
-                            f"[frame {frame_index}] direct_track_id skipped: "
-                            f"logical_id={state.logical_id} tid={det.track_id} "
-                            f"court_depth={depth:.2f}m < {min_depth}m"
-                        )
-                        continue
                 assigned_tids.add(state.current_track_id)
                 matched_lids.add(state.logical_id)
                 self._assign(state, det, frame_index, "direct_track_id", result_dets, assigned_tids)
@@ -203,7 +230,7 @@ class LogicalPlayerManager:
         missing_states = []
         for state in self.states:
             if state.logical_id not in matched_lids:
-                state.missing_frames += frame_index - state.last_seen_frame
+                state.missing_frames += 1
                 missing_states.append(state)
 
         if not missing_states:
@@ -231,7 +258,13 @@ class LogicalPlayerManager:
             match_fn=_same_team_side, reason="same_team_side",
         )
 
-        # Step 4: one-to-one fallback
+        # Step 4: proximity fallback — nearest last-known court position
+        unassigned, missing_states = self._proximity_assign(
+            missing_states, unassigned, assigned_tids, result_dets, frame_index,
+            max_distance_m=self.config.proximity_max_distance_m,
+        )
+
+        # Step 5: one-to-one fallback
         if len(missing_states) == 1 and len(unassigned) == 1:
             state = missing_states[0]
             det = unassigned[0]
@@ -269,6 +302,64 @@ class LogicalPlayerManager:
             self._assign(state, det, frame_index, reason, result_dets, assigned_tids)
             used_state_lids.add(state.logical_id)
             used_det_ids.add(id(det))
+
+        remaining_states = [s for s in missing_states if s.logical_id not in used_state_lids]
+        remaining_dets = [d for d in unassigned if d.track_id not in assigned_tids]
+        return remaining_dets, remaining_states
+
+    def _proximity_assign(
+        self,
+        missing_states: list[LogicalPlayerState],
+        unassigned: list[TrackedDetection],
+        assigned_tids: set[int],
+        result_dets: list[TrackedDetection],
+        frame_index: int,
+        max_distance_m: float,
+    ) -> tuple[list[TrackedDetection], list[LogicalPlayerState]]:
+        """Greedy nearest-court-position matching for remaining unmatched states."""
+        # Only consider states and detections that have court positions
+        eligible_states = [s for s in missing_states if s.last_court_position is not None]
+        eligible_dets = [d for d in unassigned if d.court_position is not None]
+
+        if not eligible_states or not eligible_dets:
+            return unassigned, missing_states
+
+        # Build distance matrix (states × detections)
+        state_pts = np.array([s.last_court_position for s in eligible_states])  # (S, 2)
+        det_pts = np.array([d.court_position for d in eligible_dets], dtype=float)  # (D, 2)
+        dists = np.linalg.norm(state_pts[:, None, :] - det_pts[None, :, :], axis=2)  # (S, D)
+
+        used_state_lids: set[int] = set()
+        used_det_ids: set[int] = set()
+
+        # Greedy: repeatedly pick the globally closest remaining pair
+        while True:
+            # Mask already-used rows/cols
+            available = np.ones(dists.shape, dtype=bool)
+            for si, s in enumerate(eligible_states):
+                if s.logical_id in used_state_lids:
+                    available[si, :] = False
+            for di, d in enumerate(eligible_dets):
+                if id(d) in used_det_ids:
+                    available[:, di] = False
+
+            if not available.any():
+                break
+
+            masked = np.where(available, dists, np.inf)
+            si, di = np.unravel_index(np.argmin(masked), masked.shape)
+            if masked[si, di] > max_distance_m:
+                break
+
+            state = eligible_states[si]
+            det = eligible_dets[di]
+            self._assign(state, det, frame_index, "proximity", result_dets, assigned_tids)
+            used_state_lids.add(state.logical_id)
+            used_det_ids.add(id(det))
+            logging.info(
+                f"[frame {frame_index}] proximity: logical_id={state.logical_id} "
+                f"tid→{det.track_id} dist={dists[si, di]:.2f}m"
+            )
 
         remaining_states = [s for s in missing_states if s.logical_id not in used_state_lids]
         remaining_dets = [d for d in unassigned if d.track_id not in assigned_tids]
@@ -438,23 +529,26 @@ class PlayerTracker(Tracker):
         self.config = config or PlayerTrackerConfig()
         self.court_projection = court_projection
         self.model = YOLO(self.config.model_path)
+        self.pose_model = YOLO(self.config.pose_model_path) if self.config.pose_model_path else None
         self._init_tracker()
 
     # ------------------------------------------------------------------
     # Tracker initialisation
     # ------------------------------------------------------------------
 
-    def _init_tracker(self) -> None:
+    def _init_tracker(self, effective_fps: float | None = None) -> None:
+        fps = effective_fps if effective_fps is not None else (
+            self.video_info.fps if self.video_info else 30.0
+        )
         if self.config.tracker_type == "bytetrack":
-            self._init_byte_track()
+            self._init_byte_track(fps)
         else:
-            self._init_deep_oc_sort()
+            self._init_deep_oc_sort(fps)
 
-    def _init_byte_track(self) -> None:
-        fps = self.video_info.fps if self.video_info else 30.0
-        self.byte_track = sv.ByteTrack(frame_rate=int(fps))
+    def _init_byte_track(self, effective_fps: float) -> None:
+        self.byte_track = sv.ByteTrack(frame_rate=int(effective_fps))
 
-    def _init_deep_oc_sort(self) -> None:
+    def _init_deep_oc_sort(self, effective_fps: float) -> None:
         from pathlib import Path
 
         from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
@@ -462,12 +556,13 @@ class PlayerTracker(Tracker):
         weights = Path(self.config.reid_weights)
         weights.parent.mkdir(parents=True, exist_ok=True)
         half = self.config.fp16 and self.device != "cpu"
+        max_age = max(1, round(self.config.tracker_max_age_sec * effective_fps))
         try:
             self.deep_tracker = DeepOcSort(
                 reid_weights=weights,
                 device=self.device,
                 half=half,
-                max_age=self.config.tracker_max_age,
+                max_age=max_age,
                 min_hits=self.config.tracker_min_hits,
             )
         except Exception as e:
@@ -586,17 +681,65 @@ class PlayerTracker(Tracker):
         if self.court_projection is None:
             return
         for det in fd.detections:
-            foot = np.array([det.bbox.bottom_center[0], det.bbox.bottom_center[1]])
+            if det.ankle_midpoint is not None:
+                foot = np.array(det.ankle_midpoint)
+            else:
+                foot = np.array([det.bbox.bottom_center[0], det.bbox.bottom_center[1]])
             court_pt = self._project_foot_to_court(foot)
             if court_pt is not None:
                 det.court_position = (float(court_pt[0]), float(court_pt[1]))
+
+    def _enrich_ankle_midpoints(self, fd: FrameDetections, pose_result) -> None:
+        """Set ankle_midpoint on each detection using pose keypoints (in place)."""
+        kps = pose_result.keypoints
+        if kps is None or kps.xy is None:
+            return
+        pose_boxes = pose_result.boxes.xyxy.cpu().numpy()  # (N, 4)
+        kp_xy = kps.xy.cpu().numpy()                       # (N, K, 2)
+        kp_conf = kps.conf.cpu().numpy() if kps.conf is not None else None  # (N, K) or None
+
+        lf_idx = self.config.left_foot_kp_idx
+        rf_idx = self.config.right_foot_kp_idx
+
+        for det in fd.detections:
+            if len(pose_boxes) == 0:
+                break
+            ious = _box_iou(det.bbox.as_xyxy(), pose_boxes)
+            best = int(np.argmax(ious))
+            if ious[best] < self.config.pose_iou_threshold:
+                continue
+
+            lf = kp_xy[best, lf_idx]
+            rf = kp_xy[best, rf_idx]
+
+            lf_valid = not (lf[0] == 0.0 and lf[1] == 0.0)
+            rf_valid = not (rf[0] == 0.0 and rf[1] == 0.0)
+
+            if kp_conf is not None:
+                if kp_conf[best, lf_idx] < self.config.min_keypoint_conf:
+                    lf_valid = False
+                if kp_conf[best, rf_idx] < self.config.min_keypoint_conf:
+                    rf_valid = False
+
+            if not lf_valid and not rf_valid:
+                continue
+
+            if lf_valid and rf_valid:
+                mx = (lf[0] + rf[0]) / 2.0
+                my = (lf[1] + rf[1]) / 2.0
+            elif lf_valid:
+                mx, my = float(lf[0]), float(lf[1])
+            else:
+                mx, my = float(rf[0]), float(rf[1])
+
+            det.ankle_midpoint = (mx, my)
 
     # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
     def _process_result(
-        self, result, frame_index: int, bgr_frame: np.ndarray
+        self, result, frame_index: int, bgr_frame: np.ndarray, pose_result=None
     ) -> FrameDetections:
         sv_dets = sv.Detections.from_ultralytics(result)
         person_mask = sv_dets.class_id == self.config.person_class_id
@@ -606,6 +749,8 @@ class PlayerTracker(Tracker):
             fd = self._track_bytetrack(sv_dets, frame_index)
         else:
             fd = self._track_deepocsort(sv_dets, frame_index, bgr_frame)
+        if pose_result is not None:
+            self._enrich_ankle_midpoints(fd, pose_result)
         self._enrich_court_positions(fd)
         return fd
 
@@ -685,8 +830,19 @@ class PlayerTracker(Tracker):
                 classes=[self.config.person_class_id],
                 verbose=False,
             )
-            for fi, res, bgr in zip(indices, yolo_out, batch):
-                results.append(self._process_result(res, fi, bgr))
+            pose_out = (
+                self.pose_model.predict(
+                    batch,
+                    conf=self.config.pose_confidence,
+                    imgsz=self.config.imgsz,
+                    device=self.device,
+                    verbose=False,
+                )
+                if self.pose_model is not None
+                else [None] * len(batch)
+            )
+            for fi, res, bgr, pose_res in zip(indices, yolo_out, batch, pose_out):
+                results.append(self._process_result(res, fi, bgr, pose_result=pose_res))
             pending.clear()
             pending_idx.clear()
 
@@ -745,28 +901,68 @@ class PlayerTracker(Tracker):
                 avg_conf = sum(d.confidence for d in valid_dets) / len(valid_dets)
                 score += avg_conf * 2.0
 
-            # Minor tie-breaker: prefer spatially separated detections.
-            foot_pts = []
-            for d in valid_dets:
-                if d.court_position is not None:
-                    foot_pts.append(np.array(d.court_position, dtype=float))
-                else:
-                    bc = d.bbox.bottom_center
-                    foot_pts.append(np.array([bc[0] / 100.0, bc[1] / 100.0]))
-
-            if len(foot_pts) >= 2:
-                min_dist = min(
-                    float(np.linalg.norm(foot_pts[a] - foot_pts[b]))
-                    for a in range(len(foot_pts))
-                    for b in range(a + 1, len(foot_pts))
-                )
-                score += 0.1 * min_dist
+                # Tie-breaker: prefer frames where detections are deeper inside the court.
+                avg_depth = sum(
+                    _court_depth(np.array(d.court_position))
+                    for d in valid_dets
+                    if d.court_position is not None
+                ) / len(valid_dets)
+                score += avg_depth * 2.0
 
             if score > best_score:
                 best_score = score
                 best_i = i
 
         return frames_bgr[best_i], results[best_i]
+
+    @staticmethod
+    def _score_and_select(
+        fd: FrameDetections,
+    ) -> "tuple[float, list[TrackedDetection]] | None":
+        """Score a frame for auto-selection.
+
+        Returns (score, top-4-candidates) or None if fewer than 4 valid in-court
+        detections exist. Score = minimum court depth among the 4 chosen detections,
+        so maximising it ensures even the shallowest selected player is well inside.
+        """
+        valid = [
+            d for d in fd.detections
+            if d.track_id is not None
+            and d.court_position is not None
+            and 0.0 <= d.court_position[0] <= COURT_WIDTH
+            and 0.0 <= d.court_position[1] <= COURT_LENGTH
+        ]
+        if len(valid) < 4:
+            return None
+        valid.sort(key=lambda d: _court_depth(np.array(d.court_position)), reverse=True)
+        candidates = valid[:4]
+        score = min(_court_depth(np.array(d.court_position)) for d in candidates)
+        return score, candidates
+
+    def _auto_select_players(
+        self, results: list[FrameDetections]
+    ) -> "tuple[list[TrackedDetection], FrameDetections]":
+        """Pick 4 player detections from the selection-window frames using court depth.
+
+        Scans all frames, scores each via _score_and_select, and returns the candidate
+        set and source frame from the frame with the highest score (best min court depth
+        among chosen 4).
+        """
+        best_score: float = float("-inf")
+        best_dets: list[TrackedDetection] = []
+        best_fd: FrameDetections = results[-1]
+        for fd in results:
+            result = self._score_and_select(fd)
+            if result is None:
+                continue
+            score, candidates = result
+            if score > best_score:
+                best_score, best_dets, best_fd = score, candidates, fd
+        if len(best_dets) < 4:
+            logging.warning(
+                f"Auto-selection found only {len(best_dets)} player(s) in selection window."
+            )
+        return best_dets, best_fd
 
     # ------------------------------------------------------------------
     # Main pipeline
@@ -784,8 +980,13 @@ class PlayerTracker(Tracker):
             return []
 
         fps = self.video_info.fps if self.video_info else 30.0
-        n_sel = int(self.config.selection_window_sec * fps / stride)
+        effective_fps = fps / stride
+        n_sel = int(self.config.selection_window_sec * effective_fps)
         n_sel = max(30, min(n_sel, len(frames_list)))
+
+        # Re-init tracker with effective analysis FPS so all time-based params
+        # (max_age, lost-track buffer) are calibrated to real seconds.
+        self._init_tracker(effective_fps)
 
         init_bgr = frames_list[:n_sel]
         rest_bgr = frames_list[n_sel:]
@@ -796,29 +997,49 @@ class PlayerTracker(Tracker):
         print(f"\nProcessing first {n_sel} frames for player selection...")
         init_results = self._run_frames(init_bgr, init_indices, desc="selection window")
 
-        # Phase 2: manual player selection
-        best_frame, best_fd = self._best_selection_frame(init_results, init_bgr)
-        n_tracks = len({d.track_id for d in best_fd.detections if d.track_id is not None})
-        if n_tracks < 4:
-            logging.warning(
-                f"Only {n_tracks} track(s) visible in best selection frame. "
-                "You may need to increase selection_window_sec."
+        # Debug: show raw detection counts per frame in selection window
+        for fd in init_results:
+            in_court = [
+                d for d in fd.detections
+                if d.court_position is not None
+                and 0.0 <= d.court_position[0] <= COURT_WIDTH
+                and 0.0 <= d.court_position[1] <= COURT_LENGTH
+            ]
+            print(
+                f"  frame {fd.frame_index}: {len(fd.detections)} tracked dets, "
+                f"{len(in_court)} strictly in court"
+                + (
+                    f", depths={[round(_court_depth(np.array(d.court_position)), 2) for d in in_court]}"
+                    if in_court else ""
+                )
             )
-        print(
-            f"\nOpening player selection UI — {n_tracks} track(s) visible."
-            " Click 4 players then press ENTER."
-        )
-        selected_track_ids: list[int] = PlayerSelectorUI(best_frame, best_fd).select()
-        print(f"Locked player IDs (click order = logical order): {selected_track_ids}")
 
-        # Find selected detections in best_fd preserving click order
-        by_tid = {d.track_id: d for d in best_fd.detections if d.track_id is not None}
-        selected_dets = [by_tid[tid] for tid in selected_track_ids if tid in by_tid]
-        if len(selected_dets) < 4:
-            logging.warning(
-                f"Only {len(selected_dets)} of 4 selected IDs found in best frame. "
-                "Proceeding with partial selection."
+        # Phase 2: player selection (automatic or manual)
+        if self.config.auto_select_players and self.court_projection is not None:
+            selected_dets, best_fd = self._auto_select_players(init_results)
+            selected_track_ids = [d.track_id for d in selected_dets if d.track_id is not None]
+            print(f"Auto-selected player track IDs: {selected_track_ids}")
+        else:
+            best_frame, best_fd = self._best_selection_frame(init_results, init_bgr)
+            n_tracks = len({d.track_id for d in best_fd.detections if d.track_id is not None})
+            if n_tracks < 4:
+                logging.warning(
+                    f"Only {n_tracks} track(s) visible in best selection frame. "
+                    "You may need to increase selection_window_sec."
+                )
+            print(
+                f"\nOpening player selection UI — {n_tracks} track(s) visible."
+                " Click 4 players then press ENTER."
             )
+            selected_track_ids = PlayerSelectorUI(best_frame, best_fd).select()
+            print(f"Locked player IDs (click order = logical order): {selected_track_ids}")
+            by_tid = {d.track_id: d for d in best_fd.detections if d.track_id is not None}
+            selected_dets = [by_tid[tid] for tid in selected_track_ids if tid in by_tid]
+            if len(selected_dets) < 4:
+                logging.warning(
+                    f"Only {len(selected_dets)} of 4 selected IDs found in best frame. "
+                    "Proceeding with partial selection."
+                )
 
         # Phase 3: initialize identity manager from the selected frame
         identity_manager = LogicalPlayerManager(self.config)

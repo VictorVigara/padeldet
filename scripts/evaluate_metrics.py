@@ -2,8 +2,11 @@
 Compute and display player metrics from saved detection data.
 
 Usage:
+    python scripts/evaluate_metrics.py --data-dir data/rally
+    python scripts/evaluate_metrics.py --data-dir data/rally --fps 30 --plot
+
+    # Legacy explicit paths still work:
     python scripts/evaluate_metrics.py --player-json data/rally/player_detections.json --court-keypoints data/rally/court_keypoints.json
-    python scripts/evaluate_metrics.py --player-json data/rally/player_detections.json --court-keypoints data/rally/court_keypoints.json --output data/rally/metrics.json --plot
 """
 
 import argparse
@@ -20,18 +23,32 @@ from padeldet.models import load_detections
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Compute player metrics")
-    parser.add_argument(
-        "--player-json", required=True, help="Player detections JSON"
-    )
-    parser.add_argument(
-        "--court-keypoints", required=True, help="Court keypoints JSON"
-    )
+    parser.add_argument("--data-dir", default=None, help="Folder containing player_detections.json and court_keypoints.json; outputs written here")
+    parser.add_argument("--player-json", default=None, help="Player detections JSON (overrides --data-dir)")
+    parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON (overrides --data-dir)")
     parser.add_argument("--fps", type=float, default=25.0, help="Video FPS")
-    parser.add_argument("--output", default=None, help="Save metrics to JSON")
+    parser.add_argument("--output", default=None, help="Save metrics to JSON (overrides --data-dir)")
     parser.add_argument(
         "--plot", action="store_true", help="Generate heatmap plots (requires matplotlib)"
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if args.data_dir:
+        d = Path(args.data_dir)
+        if args.player_json is None:
+            args.player_json = str(d / "player_detections.json")
+        if args.court_keypoints is None:
+            args.court_keypoints = str(d / "court_keypoints.json")
+        if args.output is None:
+            args.output = str(d / "metrics.json")
+        args._plot_prefix = str(d / "metrics")
+    else:
+        args._plot_prefix = args.output.replace(".json", "") if args.output else "metrics"
+
+    if not args.player_json or not args.court_keypoints:
+        parser.error("Provide --data-dir or both --player-json and --court-keypoints")
+
+    return args
 
 
 def print_summary(metrics: MatchMetrics) -> None:
@@ -127,8 +144,7 @@ def main():
 
     # Optional plots
     if args.plot:
-        prefix = args.output.replace(".json", "") if args.output else "metrics"
-        plot_heatmaps(metrics, prefix)
+        plot_heatmaps(metrics, args._plot_prefix)
 
 
 if __name__ == "__main__":

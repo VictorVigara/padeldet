@@ -40,6 +40,9 @@ def parse_args():
     parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON (default: <video_dir>/court_keypoints.json if it exists)")
     parser.add_argument("--tracker-type", default="deepocsort", choices=["bytetrack", "deepocsort"],
                         help="Tracking algorithm (default: deepocsort)")
+    parser.add_argument("--pose-model",
+                        default="yolo26m-pose.pt",
+                        help="YOLO pose model for ankle midpoint extraction")
     args = parser.parse_args()
 
     # Fill in defaults relative to the video folder
@@ -56,7 +59,7 @@ def parse_args():
     return args
 
 
-def print_stats(results, court_projection=None):
+def print_stats(results, court_projection=None, video_fps=None, stride=1):
     """Print detection statistics."""
     counts = [len(fd) for fd in results]
     confidences = [
@@ -68,7 +71,8 @@ def print_stats(results, court_projection=None):
     print("\n" + "=" * 50)
     print("DETECTION STATS")
     print("=" * 50)
-    print(f"Total frames: {len(results)}")
+    fps_note = f" (every {stride} frames ≈ {video_fps / stride:.1f} fps)" if stride > 1 and video_fps else ""
+    print(f"Detection frames processed: {len(results)}{fps_note}")
     print(f"Detections/frame — min: {min(counts)}, avg: {sum(counts)/len(counts):.1f}, max: {max(counts)}")
 
     if confidences:
@@ -103,12 +107,15 @@ def print_stats(results, court_projection=None):
             xs, ys = [], []
             for fd in results:
                 for d in fd.detections:
-                    if d.track_id == tid:
-                        cx, cy = court_projection.project_detection(d)
-                        xs.append(cx)
-                        ys.append(cy)
+                    if d.track_id == tid and d.court_position is not None:
+                        xs.append(d.court_position[0])
+                        ys.append(d.court_position[1])
             if xs:
-                print(f"  Player #{tid}: x=[{min(xs):.1f}, {max(xs):.1f}] y=[{min(ys):.1f}, {max(ys):.1f}]")
+                ankle_pct = sum(
+                    1 for fd in results for d in fd.detections
+                    if d.track_id == tid and d.ankle_midpoint is not None
+                ) / max(len(xs), 1) * 100
+                print(f"  Player #{tid}: x=[{min(xs):.1f}, {max(xs):.1f}] y=[{min(ys):.1f}, {max(ys):.1f}]  ankle_midpoint: {ankle_pct:.0f}%")
 
     print("=" * 50)
 
@@ -136,6 +143,7 @@ def main():
         confidence=args.confidence,
         batch_size=args.batch_size,
         tracker_type=args.tracker_type,
+        pose_model_path=args.pose_model,
     )
     tracker = PlayerTracker(
         config=config,
@@ -157,7 +165,7 @@ def main():
     results = tracker.run(frames, start_frame=args.start, stride=stride)
 
     # Print stats
-    print_stats(results, court_projection)
+    print_stats(results, court_projection, video_fps=video_info.fps, stride=stride)
 
     # Save annotated video
     print(f"\nWriting annotated video to: {args.output}")
@@ -170,6 +178,11 @@ def main():
                 last_fd = frame_lookup[abs_idx]
             if last_fd is not None:
                 annotated = last_fd.draw(frame)
+                for det in last_fd.detections:
+                    if det.ankle_midpoint is not None:
+                        ax, ay = int(det.ankle_midpoint[0]), int(det.ankle_midpoint[1])
+                        cv2.circle(annotated, (ax, ay), 6, (0, 0, 255), -1)
+                        cv2.circle(annotated, (ax, ay), 8, (255, 255, 255), 2)
                 if court_projection is not None:
                     annotated = draw_mini_court(annotated, court_projection, last_fd)
             else:
