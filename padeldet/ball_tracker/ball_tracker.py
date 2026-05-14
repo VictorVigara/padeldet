@@ -54,7 +54,8 @@ class BallTrackerConfig:
     min_consecutive: int = 3  # min consecutive detections to keep (temporal isolation)
     smooth_window: int = 5  # Savitzky-Golay window (odd, 0 to disable)
     smooth_polyorder: int = 2  # Savitzky-Golay polynomial order
-    debug: bool = False  # show live frame-by-frame debug visualization
+    debug: bool = False  # show live frame-by-frame debug visualization (final trajectory)
+    debug_heatmaps: bool = False  # show raw heatmap + binary per frame during TrackNet inference
 
 
 def _load_tracknet(weights_path: str, device: str) -> tuple[TrackNet, int, str]:
@@ -326,6 +327,106 @@ def _smooth_trajectory(
     return xs, ys, vis
 
 
+def _debug_show_heatmaps(
+    frame: np.ndarray,
+    heatmap_raw: np.ndarray,
+    heatmap_bin: np.ndarray,
+    xy_heatmap: tuple[float, float] | None,
+    prev_xy_heatmap: tuple[float, float] | None,
+    frame_idx: int,
+) -> str:
+    """Show original frame, raw heatmap, and binary threshold side by side.
+
+    Used to diagnose TrackNet failures — see what the network actually outputs
+    vs what the thresholding step produces.
+
+    Returns the key character pressed ('q'=quit, 'b'=back, ' '=play, other=next).
+    """
+    _DISP_W, _DISP_H = 640, 360  # panel size for original frame
+    _HM_SCALE = 2                  # heatmap panel upscale
+
+    # ── Left: original frame ────────────────────────────────────────────────
+    left = cv2.resize(frame, (_DISP_W, _DISP_H))
+    # Scale factors from original to display
+    sx = _DISP_W / frame.shape[1]
+    sy = _DISP_H / frame.shape[0]
+    # Scale factors from heatmap space to original frame space
+    hm_to_orig_x = frame.shape[1] / _WIDTH
+    hm_to_orig_y = frame.shape[0] / _HEIGHT
+
+    if prev_xy_heatmap is not None:
+        px = int(prev_xy_heatmap[0] * hm_to_orig_x * sx)
+        py = int(prev_xy_heatmap[1] * hm_to_orig_y * sy)
+        cv2.circle(left, (px, py), 6, (0, 0, 200), 2, cv2.LINE_AA)
+
+    if xy_heatmap is not None:
+        cx = int(xy_heatmap[0] * hm_to_orig_x * sx)
+        cy = int(xy_heatmap[1] * hm_to_orig_y * sy)
+        cv2.circle(left, (cx, cy), 8, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(left, (cx, cy), 3, (0, 255, 255), -1, cv2.LINE_AA)
+
+    # ── Middle: raw heatmap (jet colormap) ───────────────────────────────────
+    hm_u8 = (heatmap_raw * 255).clip(0, 255).astype(np.uint8)
+    hm_color = cv2.applyColorMap(hm_u8, cv2.COLORMAP_JET)
+    mid = cv2.resize(hm_color, (_WIDTH * _HM_SCALE, _HEIGHT * _HM_SCALE),
+                     interpolation=cv2.INTER_NEAREST)
+    if xy_heatmap is not None:
+        cx = int(xy_heatmap[0] * _HM_SCALE)
+        cy = int(xy_heatmap[1] * _HM_SCALE)
+        cv2.circle(mid, (cx, cy), 8, (0, 255, 255), 2, cv2.LINE_AA)
+
+    # ── Right: binary threshold with all contours ────────────────────────────
+    # Use a lower threshold so we see ALL candidate blobs, not just high-conf ones
+    low_thresh = max(0.15, heatmap_raw.max() * 0.25) if heatmap_raw.max() > 0 else 0.15
+    right_bin = (heatmap_raw > low_thresh).astype(np.uint8) * 255
+    right_bgr = cv2.cvtColor(right_bin, cv2.COLOR_GRAY2BGR)
+
+    # Draw all contours on the original-size binary, then upscale
+    contours, _ = cv2.findContours(right_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        cv2.drawContours(right_bgr, contours, -1, (0, 255, 0), 1)
+        rects = [cv2.boundingRect(c) for c in contours]
+        # Highlight largest (what _heatmap_to_xy would pick — often the wrong one)
+        largest = max(rects, key=lambda r: r[2] * r[3])
+        x, y, w, h = largest
+        cv2.rectangle(right_bgr, (x, y), (x + w, y + h), (0, 165, 255), 1)  # orange = largest
+
+    if xy_heatmap is not None:
+        cx = int(xy_heatmap[0])
+        cy = int(xy_heatmap[1])
+        cv2.circle(right_bgr, (cx, cy), 6, (0, 255, 255), 2, cv2.LINE_AA)  # cyan = detected
+
+    right = cv2.resize(right_bgr, (_WIDTH * _HM_SCALE, _HEIGHT * _HM_SCALE),
+                       interpolation=cv2.INTER_NEAREST)
+
+    # ── Resize panels to same height, concatenate ────────────────────────────
+    panel_h = _HEIGHT * _HM_SCALE  # 576
+    left_r = cv2.resize(left, (int(_DISP_W * panel_h / _DISP_H), panel_h))
+    combined = np.concatenate([left_r, mid, right], axis=1)
+
+    # ── Status bar ───────────────────────────────────────────────────────────
+    bar_h = 28
+    bar = np.zeros((bar_h, combined.shape[1], 3), dtype=np.uint8)
+    if xy_heatmap is not None:
+        status = f"Frame {frame_idx} | BALL ({xy_heatmap[0]:.0f}, {xy_heatmap[1]:.0f})"
+        if prev_xy_heatmap is not None:
+            dx = xy_heatmap[0] - prev_xy_heatmap[0]
+            dy = xy_heatmap[1] - prev_xy_heatmap[1]
+            status += f" | disp: {math.sqrt(dx*dx+dy*dy):.1f}px"
+        color = (0, 255, 255)
+    else:
+        status = f"Frame {frame_idx} | NO BALL"
+        color = (0, 100, 200)
+
+    cv2.putText(bar, status + "  [any=next  b=back  space=play  q=quit]",
+                (8, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1, cv2.LINE_AA)
+
+    display = np.vstack([combined, bar])
+    cv2.imshow("Heatmap Debug", display)
+    key = cv2.waitKey(0) & 0xFF
+    return chr(key) if key < 128 else ""
+
+
 def _debug_show(
     frames: list[np.ndarray],
     xs: list[float],
@@ -487,6 +588,7 @@ class BallTracker(Tracker):
         xs: list[float] = []
         ys: list[float] = []
         vis: list[int] = []
+        _prev_xy_heatmap: tuple[float, float] | None = None  # for heatmap debug
 
         # Build all windows
         windows = []
@@ -535,10 +637,25 @@ class BallTracker(Tracker):
                     ).sum(0)
 
                 # Threshold and extract coordinates
-                heatmap = (ensembled > self.config.heatmap_threshold).float().numpy()
+                heatmap_raw = ensembled.numpy()
+                heatmap = (heatmap_raw > self.config.heatmap_threshold).astype(np.float32)
                 xy = _heatmap_to_xy(heatmap)
 
+                if self.config.debug_heatmaps and sample_count < total:
+                    heatmap_bin_u8 = (heatmap * 255).astype(np.uint8)
+                    key = _debug_show_heatmaps(
+                        frames_list[sample_count],
+                        heatmap_raw,
+                        heatmap_bin_u8,
+                        xy,
+                        _prev_xy_heatmap,
+                        sample_count,
+                    )
+                    if key == 'q':
+                        cv2.destroyAllWindows()
+
                 if xy is not None:
+                    _prev_xy_heatmap = xy
                     cx = int(xy[0] * w_scale)
                     cy = int(xy[1] * h_scale)
                     xs.append(float(cx))

@@ -2,9 +2,9 @@
 Quick evaluation script for ball detection and tracking.
 
 Usage:
-    python scripts/evaluate_ball_tracking.py --video path/to/video.mp4 --tracknet-weights weights/TrackNet_best.pt
-    python scripts/evaluate_ball_tracking.py --video path/to/video.mp4 --tracknet-weights w/TrackNet_best.pt --inpaintnet-weights w/InpaintNet_best.pt
-    python scripts/evaluate_ball_tracking.py --video path/to/video.mp4 --tracknet-weights w/TrackNet_best.pt --player-json player_detections.json
+    python scripts/evaluate_ball_tracking.py --video data/rally/video.mp4 --tracknet-weights weights/TrackNet_best.pt
+    python scripts/evaluate_ball_tracking.py --video data/rally/video.mp4 --tracknet-weights weights/TrackNet_best.pt --inpaintnet-weights weights/InpaintNet_best.pt
+    python scripts/evaluate_ball_tracking.py --video data/rally/video.mp4 --tracknet-weights weights/TrackNet_best.pt --player-json data/rally/player_detections.json
 """
 
 import argparse
@@ -18,6 +18,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from padeldet.ball_tracker import BallTracker, BallTrackerConfig
+from padeldet.ball_tracker import KalmanBallTracker, KalmanBallTrackerConfig, save_heatmaps, load_heatmaps
+from padeldet.ball_tracker import Mog2BallTracker, Mog2BallTrackerConfig
 from padeldet.court.projection import CourtProjection, draw_mini_court
 from padeldet.court.models import CourtKeypoints
 from padeldet.models import FrameDetections, load_detections, save_detections
@@ -38,6 +40,12 @@ def parse_args():
     parser.add_argument("--player-json", default=None, help="Load player detections to overlay")
     parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON")
     parser.add_argument("--debug", default=False, action="store_true", help="Show each frame interactively (any key=next, q=quit)")
+    parser.add_argument("--tracker", default="default", choices=["default", "kalman", "mog2"], help="Tracker variant to use")
+    parser.add_argument("--heatmap-debug", default=False, action="store_true", help="Show raw heatmap + binary per frame during inference")
+    parser.add_argument("--save-heatmaps", default=None, help="Save raw TrackNet heatmaps to .npz after inference")
+    parser.add_argument("--load-heatmaps", default=None, help="Load precomputed heatmaps from .npz, skip network inference")
+    parser.add_argument("--detect-shadows", default=False, action="store_true", help="MOG2: detect shadows (marked as 127 in mask)")
+    parser.add_argument("--native-resolution", default=False, action="store_true", help="MOG2: run at native video resolution instead of 288×512")
     return parser.parse_args()
 
 
@@ -174,21 +182,50 @@ def main():
         player_results = load_detections(args.player_json)
         print(f"Player detections loaded: {len(player_results)} frames")
 
-    # Build config
-    config = BallTrackerConfig(
-        tracknet_weights=args.tracknet_weights,
-        inpaintnet_weights=args.inpaintnet_weights,
-        batch_size=args.batch_size,
-        debug=args.debug,
-    )
-    tracker = BallTracker(config=config, video_info=video_info)
-    print(f"\nTrackNet loaded, batch_size={config.batch_size}")
+    # Build tracker
+    if args.tracker == "kalman":
+        config = KalmanBallTrackerConfig(
+            tracknet_weights="" if args.load_heatmaps else args.tracknet_weights,
+            inpaintnet_weights=args.inpaintnet_weights,
+            batch_size=args.batch_size,
+            debug=args.debug,
+            debug_heatmaps=args.heatmap_debug,
+        )
+        tracker = KalmanBallTracker(config=config, video_info=video_info)
+        print(f"\nKalman tracker loaded, batch_size={config.batch_size}")
+    elif args.tracker == "mog2":
+        config = Mog2BallTrackerConfig(
+            debug=args.debug,
+            detect_shadows=args.detect_shadows,
+            use_native_resolution=args.native_resolution,
+        )
+        tracker = Mog2BallTracker(config=config, video_info=video_info)
+        print(f"\nMOG2 tracker (no neural network)")
+    else:
+        config = BallTrackerConfig(
+            tracknet_weights=args.tracknet_weights,
+            inpaintnet_weights=args.inpaintnet_weights,
+            batch_size=args.batch_size,
+            debug=args.debug,
+            debug_heatmaps=args.heatmap_debug,
+        )
+        tracker = BallTracker(config=config, video_info=video_info)
+        print(f"\nTrackNet loaded, batch_size={config.batch_size}")
     print(f"Running on: {tracker.device}")
 
-    # Run detection
+    # Run detection (or load precomputed heatmaps to skip network)
     print("\n--- Ball Detection ---")
     frames = frame_generator(video_path, start=args.start, end=args.end)
-    results = tracker.run(frames, start_frame=args.start)
+
+    if args.load_heatmaps and args.tracker in ("kalman", "mog2"):
+        precomputed, _ = load_heatmaps(args.load_heatmaps)
+        results = tracker.detect_and_track(frames, precomputed_heatmaps=precomputed)
+        tracker._results = results
+    else:
+        results = tracker.run(frames, start_frame=args.start)
+
+    if args.save_heatmaps and args.tracker in ("kalman", "mog2") and tracker.last_heatmaps is not None:
+        save_heatmaps(tracker.last_heatmaps, args.save_heatmaps, video_info)
 
     # Print stats
     print_stats(results)
