@@ -17,9 +17,18 @@ Video → Player Tracking (YOLO + DeepOCSORT + warm-up lock)
 
 ## Quick Start
 
-### Prerequisites
+### Install
+
+padeldet is a pip-installable Python package with a `pyproject.toml`. Install it into your project:
 
 ```bash
+# Editable (for active development alongside a host project):
+pip install -e /path/to/padeldet
+
+# From GitHub (for deployment environments):
+pip install git+https://github.com/VictorVigara/padeldet.git@main
+
+# For scripts in this repo:
 pip install -r requirements.txt
 ```
 
@@ -94,7 +103,11 @@ python scripts/evaluate_ball_tracking.py \
 
 ## Player Tracking
 
-YOLO detects players each frame; DeepOCSORT with OSNet ReID keeps IDs stable through occlusions. After the warm-up window (default 60 s), the 4 tracks with the highest `in_court_ratio × mean_depth` score are locked as the real players — spectators and coaches near the boundary are dropped.
+YOLO detects players each frame; DeepOCSORT with OSNet ReID keeps IDs stable through occlusions. After a selection window (default 10 s), the 4 deepest in-court tracks are auto-selected as the real players.
+
+**Device selection** — `PlayerTrackerConfig.device` controls the compute device:
+- `None` (default) — auto-detects: `"cuda"` if a GPU is available, `"cpu"` otherwise
+- `"cuda"` / `"cpu"` — explicit override, useful for testing or forcing CPU locally
 
 ```bash
 python scripts/evaluate_player_tracking.py \
