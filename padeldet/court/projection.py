@@ -58,6 +58,24 @@ class CourtProjection:
                 corners.append((float(px[0]), float(px[1])))
         return np.array(corners, dtype=np.float32)
 
+    @classmethod
+    def from_matrix(cls, H: np.ndarray, margin_meters: float = 0.5) -> "CourtProjection":
+        """Construct from a pre-computed 3×3 homography matrix (skips keypoint check)."""
+        obj = object.__new__(cls)
+        obj.keypoints = None
+        obj.margin = margin_meters
+        obj._H = np.array(H, dtype=np.float64)
+        # Back-project the 4 court corners from court-meter space to pixel space
+        H_inv = np.linalg.inv(obj._H)
+        corners_m = [(0.0, 0.0), (COURT_WIDTH, 0.0), (COURT_WIDTH, COURT_LENGTH), (0.0, COURT_LENGTH)]
+        px_corners = []
+        for cx, cy in corners_m:
+            pt = H_inv @ np.array([cx, cy, 1.0])
+            pt /= pt[2]
+            px_corners.append((float(pt[0]), float(pt[1])))
+        obj._court_polygon_px = np.array(px_corners, dtype=np.float32)
+        return obj
+
     @property
     def homography(self) -> np.ndarray:
         return self._H
