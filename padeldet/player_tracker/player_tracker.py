@@ -124,6 +124,9 @@ class PlayerTrackerConfig:
     min_keypoint_conf: float = 0.1
     pose_iou_threshold: float = 0.3
 
+    # Device override — "cuda", "cpu", or None for auto-detect (torch.cuda.is_available())
+    device: str | None = None
+
     # Logical identity / occlusion recovery
     # Not used for assignment gating — kept for backwards compatibility
     max_missing_frames: int = 90
@@ -531,6 +534,13 @@ class PlayerTracker(Tracker):
         self.model = YOLO(self.config.model_path)
         self.pose_model = YOLO(self.config.pose_model_path) if self.config.pose_model_path else None
         self._init_tracker()
+
+    @property
+    def device(self) -> str:
+        if self.config.device is not None:
+            return self.config.device
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
 
     # ------------------------------------------------------------------
     # Tracker initialisation
