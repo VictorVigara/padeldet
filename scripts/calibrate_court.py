@@ -232,9 +232,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Manual court keypoint calibration")
     parser.add_argument("--video", required=True, help="Input video path")
     parser.add_argument("--frame", type=int, default=0, help="Frame number to use")
-    parser.add_argument("--output", default="court_keypoints.json", help="Output JSON path")
+    parser.add_argument("--output", default=None, help="Output JSON path (default: <video_dir>/court_keypoints.json)")
     parser.add_argument("--load", default=None, help="Load and visualize existing keypoints")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.output is None:
+        args.output = str(Path(args.video).parent / "court_keypoints.json")
+    return args
 
 
 def main():
