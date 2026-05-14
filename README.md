@@ -147,6 +147,7 @@ modal run scripts/eval_on_modal.py \
 | `--start` | `0` | First frame to process |
 | `--end` | end of video | Last frame to process |
 | `--tracker` | `bytetrack` | `bytetrack` \| `deepocsort` |
+| `--no-video` | off | Skip annotated video output — tracking only, much faster for debugging |
 
 ### Outputs
 
@@ -166,12 +167,24 @@ All files saved next to the input video:
 - Videos < 50 MB are passed directly to the GPU function (no upload step).
 - Videos ≥ 50 MB are uploaded to the `padel-eval-videos` Modal Volume.
 - TrackNet weights are loaded from `padel_analytics/weights/ball_detection/`. Ball strategy is skipped if the files are missing.
+- The report includes `tracking_duration_s` and `annotation_duration_s` separately so you can benchmark the tracker in isolation. Use `--no-video` to skip encoding entirely.
 
 ---
 
 ## Player Tracking
 
-YOLO detects players each frame; DeepOCSORT with OSNet ReID keeps IDs stable through occlusions. After a selection window (default 10 s), the 4 deepest in-court tracks are auto-selected as the real players.
+YOLO detects players each frame; ByteTrack/DeepOCSORT keeps IDs stable through occlusions. After a selection window (default 10 s), the 4 deepest in-court tracks are auto-selected as the real players.
+
+**Logical player IDs** are assigned by court quadrant and remain stable for the entire video:
+
+| ID | Side | Position |
+|----|------|----------|
+| P1 | Near | Left |
+| P2 | Near | Right |
+| P3 | Far  | Left |
+| P4 | Far  | Right |
+
+Near = camera side (Y < 10 m), Far = opposite baseline (Y ≥ 10 m). Left/right from the camera's perspective (X < 5 m / X ≥ 5 m). The mini-court overlay uses fixed colors matching the app: P1=green, P2=orange, P3=blue, P4=pink.
 
 **Device selection** — `PlayerTrackerConfig.device` controls the compute device:
 - `None` (default) — auto-detects: `"cuda"` if a GPU is available, `"cpu"` otherwise

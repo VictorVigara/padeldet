@@ -24,21 +24,22 @@ def build_player_tracks(
     Projects each detection to court coordinates, groups by track_id,
     interpolates short gaps, and applies Savitzky-Golay smoothing.
     """
-    # Collect raw positions per track_id
+    # Collect raw positions per logical_player_id (stable 1-4); skip unassigned detections.
     raw: dict[int, list[tuple[int, float, float]]] = {}
 
     for fd in detections:
         for det in fd.detections:
-            if det.track_id is None:
+            pid = det.logical_player_id
+            if pid is None:
                 continue
             court_pos = projection.project_detection(det)
             if not projection.is_inside_court(court_pos):
                 continue
-            raw.setdefault(det.track_id, []).append(
+            raw.setdefault(pid, []).append(
                 (fd.frame_index, court_pos[0], court_pos[1])
             )
 
-    # Build PlayerTrack for each track_id
+    # Build PlayerTrack for each logical_player_id
     tracks: dict[int, PlayerTrack] = {}
     for tid, positions in raw.items():
         positions.sort(key=lambda p: p[0])

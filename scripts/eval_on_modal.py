@@ -129,6 +129,7 @@ def run_eval(
     end: int | None,
     tracker: str = "bytetrack",
     video_bytes: bytes | None = None,
+    annotate_video: bool = True,
 ) -> dict:
     import json
     import time
@@ -166,12 +167,14 @@ def run_eval(
 
     if strategy in ("player", "all"):
         report["player"] = _run_player(
-            video_path, video_info, court_projection, stride, start, end, tracker
+            video_path, video_info, court_projection, stride, start, end, tracker,
+            annotate_video=annotate_video,
         )
 
     if strategy in ("ball", "all"):
         report["ball"] = _run_ball(
-            video_path, video_info, court_projection, start, end
+            video_path, video_info, court_projection, start, end,
+            annotate_video=annotate_video,
         )
 
     eval_volume.commit()
@@ -179,7 +182,7 @@ def run_eval(
     return report
 
 
-def _run_player(video_path, video_info, court_projection, stride, start, end, tracker="bytetrack"):
+def _run_player(video_path, video_info, court_projection, stride, start, end, tracker="bytetrack", annotate_video=True):
     import time
     import cv2
     from padeldet.player_tracker import PlayerTracker, PlayerTrackerConfig
@@ -198,32 +201,37 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
         auto_select_players=True,
         device="cuda",
     )
-    tracker = PlayerTracker(config=config, video_info=video_info, court_projection=court_projection)
+    tracker_obj = PlayerTracker(config=config, video_info=video_info, court_projection=court_projection)
     frames = frame_generator(video_path, start=start, end=end, stride=stride)
-    player_results = tracker.run(frames, start_frame=start, stride=stride)
+    player_results = tracker_obj.run(frames, start_frame=start, stride=stride)
+    tracking_duration_s = round(time.time() - t0, 1)
 
-    # Annotated video — draw every frame, interpolate detections for skipped frames.
-    out_path = f"{_MOUNT}/modal_player_output.mp4"
-    frame_lookup = {fd.frame_index: fd for fd in player_results}
-    last_fd = None
-    abs_idx = start
-    with VideoWriter(out_path, video_info) as writer:
-        for frame in frame_generator(video_path, start=start, end=end):
-            if abs_idx in frame_lookup:
-                last_fd = frame_lookup[abs_idx]
-            if last_fd is not None:
-                annotated = last_fd.draw(frame)
-                for det in last_fd.detections:
-                    if det.ankle_midpoint is not None:
-                        ax, ay = int(det.ankle_midpoint[0]), int(det.ankle_midpoint[1])
-                        cv2.circle(annotated, (ax, ay), 6, (0, 0, 255), -1)
-                        cv2.circle(annotated, (ax, ay), 8, (255, 255, 255), 2)
-                if court_projection is not None:
-                    annotated = draw_mini_court(annotated, court_projection, last_fd)
-            else:
-                annotated = frame
-            writer.write(annotated)
-            abs_idx += 1
+    if annotate_video:
+        t_ann = time.time()
+        out_path = f"{_MOUNT}/modal_player_output.mp4"
+        frame_lookup = {fd.frame_index: fd for fd in player_results}
+        last_fd = None
+        abs_idx = start
+        with VideoWriter(out_path, video_info) as writer:
+            for frame in frame_generator(video_path, start=start, end=end):
+                if abs_idx in frame_lookup:
+                    last_fd = frame_lookup[abs_idx]
+                if last_fd is not None:
+                    annotated = last_fd.draw(frame)
+                    for det in last_fd.detections:
+                        if det.ankle_midpoint is not None:
+                            ax, ay = int(det.ankle_midpoint[0]), int(det.ankle_midpoint[1])
+                            cv2.circle(annotated, (ax, ay), 6, (0, 0, 255), -1)
+                            cv2.circle(annotated, (ax, ay), 8, (255, 255, 255), 2)
+                    if court_projection is not None:
+                        annotated = draw_mini_court(annotated, court_projection, last_fd)
+                else:
+                    annotated = frame
+                writer.write(annotated)
+                abs_idx += 1
+        annotation_duration_s = round(time.time() - t_ann, 1)
+    else:
+        annotation_duration_s = 0
 
     save_detections(player_results, f"{_MOUNT}/modal_player_detections.json")
 
@@ -241,7 +249,9 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
         "avg_detections_per_frame": round(sum(counts) / max(len(counts), 1), 2),
         "frames_with_4_players": sum(1 for c in counts if c == 4),
         "frames_with_lt4_players": sum(1 for c in counts if c < 4),
-        "duration_s": round(time.time() - t0, 1),
+        "tracking_duration_s": tracking_duration_s,
+        "annotation_duration_s": annotation_duration_s,
+        "duration_s": tracking_duration_s + annotation_duration_s,
     }
 
     if court_projection is not None:
@@ -340,6 +350,7 @@ def main(
     start: int = 0,
     end: str = "",
     tracker: str = "bytetrack",
+    no_video: bool = False,
 ):
     import json
     from pathlib import Path
@@ -394,6 +405,7 @@ def main(
         end=end_frame,
         tracker=tracker,
         video_bytes=video_bytes,
+        annotate_video=not no_video,
     )
 
     print("\n=== Report ===")
@@ -402,11 +414,15 @@ def main(
     # Download output files from volume.
     output_files: list[str] = []
     if strategy in ("player", "all"):
-        output_files += ["modal_player_output.mp4", "modal_player_detections.json"]
+        if not no_video:
+            output_files.append("modal_player_output.mp4")
+        output_files.append("modal_player_detections.json")
         if keypoints_dict is not None:
             output_files.append("modal_metrics.json")
     if strategy in ("ball", "all"):
-        output_files += ["modal_ball_output.mp4", "modal_ball_detections.json"]
+        if not no_video:
+            output_files.append("modal_ball_output.mp4")
+        output_files.append("modal_ball_detections.json")
 
     print("\nDownloading outputs...")
     for filename in output_files:
