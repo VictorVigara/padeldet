@@ -126,13 +126,14 @@ class CourtProjection:
 # ── Mini-court visualization ────────────────────────────────────────
 
 # Track ID → color mapping (BGR)
+# Index 0–3 match AppColors.player1–4 (green, orange, blue, pink); extras for fallback.
 _PLAYER_COLORS = [
-    (0, 0, 255),     # red
-    (255, 0, 0),     # blue
-    (0, 200, 0),     # green
-    (0, 200, 255),   # orange
-    (255, 0, 255),   # magenta
-    (255, 255, 0),   # cyan
+    (0, 200, 0),     # P1 green
+    (0, 165, 255),   # P2 orange
+    (255, 0, 0),     # P3 blue
+    (180, 105, 255), # P4 pink
+    (255, 0, 255),   # fallback magenta
+    (255, 255, 0),   # fallback cyan
 ]
 
 
@@ -227,28 +228,37 @@ def draw_mini_court(
     )
 
     # Draw player positions
-    track_color_map: dict[int, tuple[int, int, int]] = {}
-    color_idx = 0
+    fallback_color_map: dict[int, tuple[int, int, int]] = {}
+    fallback_color_idx = len(_PLAYER_COLORS) - 2  # start at the fallback entries
 
     for det in detections.detections:
         court_pos = projection.project_detection(det)
 
-        # Assign color by track_id
-        tid = det.track_id if det.track_id is not None else -1
-        if tid not in track_color_map:
-            track_color_map[tid] = _PLAYER_COLORS[color_idx % len(_PLAYER_COLORS)]
-            color_idx += 1
-        color = track_color_map[tid]
+        # Use logical_player_id for a stable color (P1–P4 match AppColors); fall back to track_id.
+        if det.logical_player_id is not None:
+            color = _PLAYER_COLORS[(det.logical_player_id - 1) % len(_PLAYER_COLORS)]
+        else:
+            tid = det.track_id if det.track_id is not None else -1
+            if tid not in fallback_color_map:
+                fallback_color_map[tid] = _PLAYER_COLORS[fallback_color_idx % len(_PLAYER_COLORS)]
+                fallback_color_idx += 1
+            color = fallback_color_map[tid]
 
         # Only draw if inside court (with generous margin for visualization)
         if projection.is_inside_court(court_pos):
             mx, my = court_to_mini(court_pos[0], court_pos[1])
             cv2.circle(frame, (mx, my), 5, color, -1, cv2.LINE_AA)
             cv2.circle(frame, (mx, my), 5, (255, 255, 255), 1, cv2.LINE_AA)
-            if det.track_id is not None:
+            label = (
+                f"P{det.logical_player_id}"
+                if det.logical_player_id is not None
+                else str(det.track_id) if det.track_id is not None
+                else None
+            )
+            if label is not None:
                 cv2.putText(
                     frame,
-                    str(det.track_id),
+                    label,
                     (mx + 6, my - 3),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.35,

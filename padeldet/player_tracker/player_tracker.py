@@ -87,6 +87,21 @@ def _court_depth(court_position: np.ndarray) -> float:
     return min(x, COURT_WIDTH - x, y, COURT_LENGTH - y)
 
 
+def _position_sort_key(det: TrackedDetection) -> tuple[int, int]:
+    """Sort key mapping a detection to a position bucket.
+
+    Bucket order: (team_side, play_side) → near-left=0, near-right=1, far-left=2, far-right=3.
+    When detections are sorted by this key and assigned IDs 1-4 in order the result is:
+      ID 1 → near-left, ID 2 → near-right, ID 3 → far-left, ID 4 → far-right.
+    """
+    if det.court_position is None:
+        return (1, 1)
+    x, y = det.court_position
+    team_bucket = 0 if y < COURT_LENGTH / 2 else 1
+    side_bucket = 0 if x < COURT_WIDTH / 2 else 1
+    return (team_bucket, side_bucket)
+
+
 @dataclass
 class PlayerTrackerConfig:
     """Configuration for player detection and tracking."""
@@ -173,7 +188,12 @@ class LogicalPlayerManager:
         selected_detections: list[TrackedDetection],
         frame_index: int,
     ) -> None:
-        """Create logical players 1..4 from selected detections (click order)."""
+        """Create logical players 1..4 from selected detections.
+
+        IDs are assigned by court quadrant regardless of input order:
+        1=near-left, 2=near-right, 3=far-left, 4=far-right.
+        """
+        selected_detections = sorted(selected_detections, key=_position_sort_key)
         self.states = []
         for i, det in enumerate(selected_detections):
             court_pos = (
@@ -1061,8 +1081,13 @@ class PlayerTracker(Tracker):
 
         sel_frame_idx = best_fd.frame_index
         selected_tid_set = set(selected_track_ids)
-        # Approximate logical ID by click order for frames before the selection frame
-        tid_to_logical = {tid: (i + 1) for i, tid in enumerate(selected_track_ids)}
+        # Build tid→logical map from the identity manager so pre-selection frames
+        # use the same position-sorted assignment as post-selection frames.
+        tid_to_logical = {
+            s.current_track_id: s.logical_id
+            for s in identity_manager.states
+            if s.current_track_id is not None
+        }
 
         # Phase 4: assign identities over init_results
         final_results: list[FrameDetections] = []

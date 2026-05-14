@@ -47,6 +47,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - **Not a Tracker** — court detection is static, not a tracking problem
 - `models.py` — `CourtKeypoints` dataclass (12-point schema), court dimensions in meters, `COURT_KEYPOINTS_2D` reference coords
 - `projection.py` — `CourtProjection` (homography via `cv2.findHomography`), point projection, court polygon check, `draw_mini_court()` overlay
+- `draw_mini_court()` labels players as `P1`–`P4` (falls back to raw track ID pre-selection); colors are fixed per logical ID matching `AppColors` (P1=green, P2=orange, P3=blue, P4=pink)
 - Supports partial keypoints (some can be None/skipped), needs ≥4 for homography
 - Manual calibration via `scripts/calibrate_court.py`, auto-detection can be added later
 
@@ -62,7 +63,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 ### Metrics Module (`padeldet/metrics/`)
 - **Offline computation** from saved player detection JSON + court keypoints
 - `compute_metrics(detections, projection, fps)` → `MatchMetrics`
-- **Position pipeline**: project to court meters → interpolate short gaps → Savitzky-Golay smoothing
+- **Position pipeline**: groups by `logical_player_id` (not raw track ID) → project to court meters → interpolate short gaps → Savitzky-Golay smoothing
 - **Team assignment**: median Y over first 30 frames, split near/far at net (10m)
 - **Per-player metrics**: distance covered, speed (avg/max/distribution), zone time (net/transition/back), net approaches, position heatmap
 - **Per-team metrics**: formation classification (both-at-net, both-at-back, one-up-one-back)
@@ -70,7 +71,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - Speed categories: stationary (<0.5 m/s), walking (0.5-2), jogging (2-4), sprinting (>4)
 - JSON serialization via `MatchMetrics.save()`/`load()`
 
-### Player Filtering Strategy (Sprint 3 Task 2)
+### Player Filtering & Identity Strategy
 - **Warm-up window** (default 60 s, configurable via `warmup_duration_sec`): observe all tracks, accumulate `in_court_ratio` and `mean_depth_m` (average distance to nearest court line in meters)
 - **Score** = `in_court_ratio × mean_depth_m` — ranks real players (deep inside) above boundary spectators (near glass wall, depth ≈ 0)
 - After warm-up: lock the top-4 by score as `locked_player_ids`; log extras as `suspected_duplicate`
@@ -78,6 +79,7 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - Without court projection: falls back to raw detection frequency
 - `tracker.warmup_metrics` dict (tid → ratio/depth/score/locked) available after tracking for inspection
 - `tracker.warmup_frames_used` stores the actual frame count used for the warm-up window
+- **Logical player IDs** are assigned by court quadrant (not selection order): P1=near-left, P2=near-right, P3=far-left, P4=far-right — consistent across the whole video including pre-selection frames
 
 ### Video I/O (`padeldet/video.py`)
 - `VideoInfo` dataclass + `frame_generator()` using OpenCV
