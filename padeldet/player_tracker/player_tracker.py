@@ -567,10 +567,14 @@ class PlayerTracker(Tracker):
         weights.parent.mkdir(parents=True, exist_ok=True)
         half = self.config.fp16 and self.device != "cpu"
         max_age = max(1, round(self.config.tracker_max_age_sec * effective_fps))
+        # boxmot's select_device rejects the string "cuda" when CUDA_VISIBLE_DEVICES
+        # is set to a non-numeric value (e.g. Modal sets it to "cuda"). Pass integer
+        # device index 0 instead, which bypasses that validation.
+        boxmot_device = 0 if self.device == "cuda" else self.device
         try:
             self.deep_tracker = DeepOcSort(
                 reid_weights=weights,
-                device=self.device,
+                device=boxmot_device,
                 half=half,
                 max_age=max_age,
                 min_hits=self.config.tracker_min_hits,
