@@ -99,7 +99,7 @@ class PlayerTrackerConfig:
     person_class_id: int = 0  # COCO person class
     max_players: int = 10
     # Seconds of video to process before pausing for manual player selection
-    selection_window_sec: float = 10.0
+    selection_window_sec: float = 2.0
     # Tracker selection
     tracker_type: Literal["bytetrack", "deepocsort"] = "deepocsort"
     # DeepOCSORT-specific
