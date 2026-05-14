@@ -101,6 +101,74 @@ python scripts/evaluate_ball_tracking.py \
 
 ---
 
+## GPU Evaluation on Modal
+
+`scripts/eval_on_modal.py` runs any strategy on a cloud T4 GPU and downloads the annotated video + JSON results back to disk — no production job queue involved.
+
+### Prerequisites (one-time)
+
+```bash
+pip install modal
+modal setup   # authenticate with your Modal account
+```
+
+### Usage
+
+```bash
+# Player tracking at 5 fps detection rate
+modal run scripts/eval_on_modal.py \
+    --video data/rally/video.mp4 \
+    --keypoints data/rally/court_keypoints.json \
+    --fps 5
+
+# All frames (omit --fps or pass 0)
+modal run scripts/eval_on_modal.py \
+    --video data/rally/video.mp4
+
+# Ball tracking only
+modal run scripts/eval_on_modal.py \
+    --video data/rally/video.mp4 \
+    --strategy ball
+
+# Both trackers, first 500 frames only
+modal run scripts/eval_on_modal.py \
+    --video data/rally/video.mp4 \
+    --strategy all --start 0 --end 500
+```
+
+### Arguments
+
+| Flag | Default | Description |
+|---|---|---|
+| `--video` | required | Input video path |
+| `--keypoints` | auto-detected | `court_keypoints.json` (looks in same folder as video if omitted) |
+| `--strategy` | `player` | `player` \| `ball` \| `all` |
+| `--fps` | `0` (all frames) | Detection rate in fps — stride computed automatically from video fps |
+| `--start` | `0` | First frame to process |
+| `--end` | end of video | Last frame to process |
+| `--tracker` | `bytetrack` | `bytetrack` \| `deepocsort` |
+
+### Outputs
+
+All files saved next to the input video:
+
+| File | Contents |
+|---|---|
+| `modal_player_output.mp4` | Annotated video — bboxes, ankle dots, mini-court overlay |
+| `modal_player_detections.json` | Raw per-frame player detections |
+| `modal_metrics.json` | Distance, speed, heatmap stats (requires keypoints) |
+| `modal_ball_output.mp4` | Annotated video with ball trajectory trail |
+| `modal_ball_detections.json` | Raw per-frame ball detections |
+
+### Notes
+
+- First run builds the Modal image (~3–5 min, cached after that).
+- Videos < 50 MB are passed directly to the GPU function (no upload step).
+- Videos ≥ 50 MB are uploaded to the `padel-eval-videos` Modal Volume.
+- TrackNet weights are loaded from `padel_analytics/weights/ball_detection/`. Ball strategy is skipped if the files are missing.
+
+---
+
 ## Player Tracking
 
 YOLO detects players each frame; DeepOCSORT with OSNet ReID keeps IDs stable through occlusions. After a selection window (default 10 s), the 4 deepest in-court tracks are auto-selected as the real players.
@@ -163,6 +231,7 @@ padeldet/
 │   ├── court/                       # Homography, CourtKeypoints
 │   └── metrics/                     # Distance, speed, zones, formations
 ├── scripts/
+│   ├── eval_on_modal.py             # Plug-and-play GPU evaluation (T4, any strategy)
 │   ├── evaluate_player_tracking.py
 │   ├── evaluate_ball_tracking.py
 │   ├── compare_strategies.py        # Multi-strategy heatmap comparison
