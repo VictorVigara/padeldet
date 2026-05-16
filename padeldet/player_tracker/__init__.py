@@ -1,1 +1,3 @@
-from .player_tracker import PlayerSelectorUI, PlayerTracker, PlayerTrackerConfig
+from .config import PlayerTrackerConfig
+from .player_tracker import PlayerTracker
+from .selector import PlayerSelectorUI
