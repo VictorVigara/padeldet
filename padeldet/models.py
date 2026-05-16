@@ -75,6 +75,7 @@ class TrackedDetection(Detection):
     court_position: tuple[float, float] | None = None
     logical_player_id: int | None = None
     visible: bool = True
+    is_on_court: bool = True
     ankle_midpoint: tuple[float, float] | None = None
     keypoints: list[tuple[float, float, float]] | None = None  # (x, y, conf) per COCO keypoint — 17 joints in COCO order
 
@@ -84,6 +85,7 @@ class TrackedDetection(Detection):
         data["court_position"] = list(self.court_position) if self.court_position is not None else None
         data["logical_player_id"] = self.logical_player_id
         data["visible"] = self.visible
+        data["is_on_court"] = self.is_on_court
         data["ankle_midpoint"] = [float(self.ankle_midpoint[0]), float(self.ankle_midpoint[1])] if self.ankle_midpoint is not None else None
         data["keypoints"] = (
             [[kp[0], kp[1], kp[2]] for kp in self.keypoints]
@@ -106,6 +108,7 @@ class TrackedDetection(Detection):
             court_position=tuple(cp) if cp is not None else None,
             logical_player_id=d.get("logical_player_id"),
             visible=d.get("visible", True),
+            is_on_court=d.get("is_on_court", True),
             ankle_midpoint=tuple(amp) if amp is not None else None,
             keypoints=keypoints,
         )
@@ -197,6 +200,8 @@ class FrameDetections:
                     parts.append(f"#{det.track_id}")
             if show_confidence:
                 parts.append(f"{det.confidence:.2f}")
+            if not det.is_on_court:
+                parts.append("[OUT]")
             labels.append(" ".join(parts))
 
         frame = label_annotator.annotate(

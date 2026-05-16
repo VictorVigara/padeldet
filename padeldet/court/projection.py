@@ -232,7 +232,11 @@ def draw_mini_court(
     fallback_color_idx = len(_PLAYER_COLORS) - 2  # start at the fallback entries
 
     for det in detections.detections:
-        court_pos = projection.project_detection(det)
+        # Prefer already-enriched court_position; re-project as fallback.
+        if det.court_position is not None:
+            court_x, court_y = det.court_position
+        else:
+            court_x, court_y = projection.project_detection(det)
 
         # Use logical_player_id for a stable color (P1–P4 match AppColors); fall back to track_id.
         if det.logical_player_id is not None:
@@ -244,17 +248,34 @@ def draw_mini_court(
                 fallback_color_idx += 1
             color = fallback_color_map[tid]
 
-        # Only draw if inside court (with generous margin for visualization)
-        if projection.is_inside_court(court_pos):
-            mx, my = court_to_mini(court_pos[0], court_pos[1])
+        label = (
+            f"P{det.logical_player_id}"
+            if det.logical_player_id is not None
+            else str(det.track_id) if det.track_id is not None
+            else None
+        )
+
+        if not det.is_on_court:
+            # Clamp to court boundary so marker lands on the door edge in the mini-court.
+            cx = max(0.0, min(COURT_WIDTH, court_x))
+            cy = max(0.0, min(COURT_LENGTH, court_y))
+            mx, my = court_to_mini(cx, cy)
+            dim_color = tuple(int(c * 0.5) for c in color)
+            cv2.circle(frame, (mx, my), 5, dim_color, 2, cv2.LINE_AA)
+            if label is not None:
+                cv2.putText(
+                    frame,
+                    label + " OUT",
+                    (mx + 6, my - 3),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35,
+                    (180, 180, 180),
+                    1,
+                )
+        elif projection.is_inside_court((court_x, court_y)):
+            mx, my = court_to_mini(court_x, court_y)
             cv2.circle(frame, (mx, my), 5, color, -1, cv2.LINE_AA)
             cv2.circle(frame, (mx, my), 5, (255, 255, 255), 1, cv2.LINE_AA)
-            label = (
-                f"P{det.logical_player_id}"
-                if det.logical_player_id is not None
-                else str(det.track_id) if det.track_id is not None
-                else None
-            )
             if label is not None:
                 cv2.putText(
                     frame,

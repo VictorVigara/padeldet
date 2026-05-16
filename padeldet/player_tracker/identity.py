@@ -8,7 +8,7 @@ from typing import Literal
 
 import numpy as np
 
-from ..court.models import COURT_LENGTH, COURT_WIDTH
+from ..court.models import COURT_LENGTH, COURT_WIDTH, DOOR_Y_MAX, DOOR_Y_MIN
 from ..models import BoundingBox, FrameDetections, TrackedDetection
 from .config import PlayerTrackerConfig
 
@@ -60,6 +60,18 @@ def _court_depth(court_position: np.ndarray) -> float:
     return min(x, COURT_WIDTH - x, y, COURT_LENGTH - y)
 
 
+def _is_valid_player_position(court_position: tuple[float, float]) -> bool:
+    """Return True if a court-meter position is acceptable for player assignment.
+
+    Accepts positions inside the court or exiting through a side door.
+    Rejects anything else (spectator behind far/near glass, positional noise).
+    """
+    x, y = float(court_position[0]), float(court_position[1])
+    in_court = 0.0 <= x <= COURT_WIDTH and 0.0 <= y <= COURT_LENGTH
+    door_exit = (x < 0.0 or x > COURT_WIDTH) and DOOR_Y_MIN <= y <= DOOR_Y_MAX
+    return in_court or door_exit
+
+
 def _position_sort_key(det: TrackedDetection) -> tuple[int, int]:
     """Sort key mapping a detection to a position bucket.
 
@@ -89,6 +101,7 @@ class LogicalPlayerState:
     play_side: Literal["left", "right"] | None
     last_seen_frame: int
     missing_frames: int = 0  # for logging/debugging only, not used for assignment gating
+    is_on_court: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -152,14 +165,21 @@ class LogicalPlayerManager:
         matched_lids: set[int] = set()
 
         # Step 1: direct track_id matching
-        # Trust DeepOCSORT's ReID here unconditionally — if the same track_id comes
-        # back, the tracker has visual evidence it's the same person. The court-edge
-        # depth filter only applies in Steps 2-5, where we're blindly assigning a
-        # new track_id to a logical player by position/role.
+        # ReID gives strong evidence, but we still validate court position to reject
+        # cases where the tracker incorrectly re-uses a player's track_id on a spectator.
+        # Accept only if the detection is inside the court OR exiting through a door.
+        # Any other out-of-bounds position (e.g. spectator behind far glass, y > COURT_LENGTH)
+        # is rejected — the player stays missing and falls through to Steps 2-5.
         min_depth = self.config.min_direct_match_court_depth_m
         for state in self.states:
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
+                if det.court_position is not None and not _is_valid_player_position(det.court_position):
+                    logging.debug(
+                        f"[frame {frame_index}] direct_track_id rejected (invalid position "
+                        f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                    )
+                    continue
                 assigned_tids.add(state.current_track_id)
                 matched_lids.add(state.logical_id)
                 self._assign(state, det, frame_index, "direct_track_id", result_dets, assigned_tids)
@@ -210,7 +230,13 @@ class LogicalPlayerManager:
         if len(missing_states) == 1 and len(unassigned) == 1:
             state = missing_states[0]
             det = unassigned[0]
-            self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
+            if det.court_position is not None and not _is_valid_player_position(det.court_position):
+                logging.debug(
+                    f"[frame {frame_index}] one_to_one_fallback rejected (invalid position "
+                    f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                )
+            else:
+                self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
 
         return FrameDetections(frame_index=fd.frame_index, detections=result_dets)
 
@@ -347,6 +373,12 @@ class LogicalPlayerManager:
                 state.team_side = _team_side(new_court)
             if state.play_side is None:
                 state.play_side = _play_side(new_court)
+            x, y = float(new_court[0]), float(new_court[1])
+            exited_side = x < 0.0 or x > COURT_WIDTH
+            near_door = DOOR_Y_MIN <= y <= DOOR_Y_MAX
+            on_court = not (exited_side and near_door)
+            state.is_on_court = on_court
+            det.is_on_court = on_court
         state.last_bbox = det.bbox
         state.last_seen_frame = frame_index
         state.missing_frames = 0
