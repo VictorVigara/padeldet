@@ -24,6 +24,93 @@ from padeldet.court.models import (
 )
 
 
+class FrameSelector:
+    """Interactive frame navigator — pick the frame to calibrate on."""
+
+    WINDOW_NAME = "Select Frame"
+
+    def __init__(self, video_path: str, start_frame: int = 0):
+        self.cap = cv2.VideoCapture(video_path)
+        if not self.cap.isOpened():
+            raise IOError(f"Cannot open video {video_path}")
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.frame_idx = max(0, min(start_frame, self.total_frames - 1))
+        self._frame_cache: dict[int, np.ndarray] = {}
+
+    def _read_frame(self, idx: int) -> np.ndarray:
+        if idx in self._frame_cache:
+            return self._frame_cache[idx]
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = self.cap.read()
+        if not ret:
+            return np.zeros((720, 1280, 3), dtype=np.uint8)
+        self._frame_cache[idx] = frame
+        return frame
+
+    def _draw(self, frame: np.ndarray) -> np.ndarray:
+        display = frame.copy()
+        h, w = display.shape[:2]
+        time_sec = self.frame_idx / self.fps
+        info = (
+            f"Frame {self.frame_idx}/{self.total_frames - 1}  "
+            f"({time_sec:.1f}s)  |  "
+            f"←→ \xb11f   A/D \xb130f   [/] \xb11s   Enter=confirm   Esc=cancel"
+        )
+        cv2.rectangle(display, (0, 0), (w, 35), (0, 0, 0), -1)
+        cv2.putText(display, info, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+        return display
+
+    def run(self) -> tuple[int, np.ndarray] | None:
+        """Returns (frame_index, frame) or None if cancelled."""
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.WINDOW_NAME, 1280, 720)
+
+        print("\nFrame Selection")
+        print("=" * 40)
+        print("  ←/→        step ±1 frame")
+        print("  A / D      jump ±30 frames")
+        print("  [ / ]      jump ±1 second")
+        print("  Enter      confirm frame")
+        print("  Escape     cancel")
+        print()
+
+        while True:
+            frame = self._read_frame(self.frame_idx)
+            cv2.imshow(self.WINDOW_NAME, self._draw(frame))
+            key = cv2.waitKey(30) & 0xFF
+
+            step = None
+            if key == 27:  # Escape
+                cv2.destroyWindow(self.WINDOW_NAME)
+                self.cap.release()
+                return None
+            elif key in (13, 32):  # Enter / Space
+                cv2.destroyWindow(self.WINDOW_NAME)
+                self.cap.release()
+                print(f"  Selected frame {self.frame_idx} ({self.frame_idx / self.fps:.1f}s)")
+                return self.frame_idx, frame
+            elif key == 81 or key == 2:   # left arrow (Linux / Mac)
+                step = -1
+            elif key == 83 or key == 3:   # right arrow
+                step = 1
+            elif key == ord("a") or key == ord("A"):
+                step = -30
+            elif key == ord("d") or key == ord("D"):
+                step = 30
+            elif key == ord("["):
+                step = -int(self.fps)
+            elif key == ord("]"):
+                step = int(self.fps)
+
+            if step is not None:
+                self.frame_idx = max(0, min(self.frame_idx + step, self.total_frames - 1))
+
+        cv2.destroyWindow(self.WINDOW_NAME)
+        self.cap.release()
+        return None
+
+
 class CalibrationTool:
     """Interactive OpenCV tool for clicking court keypoints."""
 
@@ -243,24 +330,16 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Read the target frame
-    cap = cv2.VideoCapture(args.video)
-    if not cap.isOpened():
-        print(f"Error: Cannot open video {args.video}")
-        sys.exit(1)
-
-    if args.frame > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, args.frame)
-
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret:
-        print(f"Error: Cannot read frame {args.frame}")
-        sys.exit(1)
-
     print(f"Video: {args.video}")
-    print(f"Frame: {args.frame}")
+
+    selector = FrameSelector(args.video, start_frame=args.frame)
+    result = selector.run()
+    if result is None:
+        print("\nCancelled.")
+        sys.exit(0)
+    frame_idx, frame = result
+
+    print(f"Frame: {frame_idx}")
     print(f"Resolution: {frame.shape[1]}x{frame.shape[0]}")
 
     # Visualize existing keypoints
@@ -269,6 +348,7 @@ def main():
         print(f"\nLoaded {keypoints.num_available} keypoints from {args.load}")
         visualize_keypoints(frame, keypoints)
         return
+
 
     # Run calibration
     tool = CalibrationTool(frame)
