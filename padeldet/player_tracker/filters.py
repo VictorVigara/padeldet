@@ -166,6 +166,12 @@ def enrich_ankle_midpoints(
         if ious[best] < config.pose_iou_threshold:
             continue
 
+        det.keypoints = [
+            (float(kp_xy[best, k, 0]), float(kp_xy[best, k, 1]),
+             float(kp_conf[best, k]) if kp_conf is not None else 1.0)
+            for k in range(kp_xy.shape[1])
+        ]
+
         lf = kp_xy[best, lf_idx]
         rf = kp_xy[best, rf_idx]
 

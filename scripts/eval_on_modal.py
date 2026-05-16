@@ -42,11 +42,11 @@ Strategies:
     all     — both sequentially
 
 Outputs saved next to the input video:
-    modal_player_output.mp4        annotated video with bboxes + mini-court overlay
-    modal_player_detections.json   raw per-frame player detections
-    modal_metrics.json             distance, speed, heatmap stats (requires keypoints)
-    modal_ball_output.mp4          annotated video with ball trail
-    modal_ball_detections.json     raw per-frame ball detections
+    player_output.mp4        annotated video with bboxes + mini-court overlay
+    player_detections.json   raw per-frame player detections
+    metrics.json             distance, speed, heatmap stats (requires keypoints)
+    ball_output.mp4          annotated video with ball trail
+    ball_detections.json     raw per-frame ball detections
 
 Notes:
     - First run builds the Modal image (~3-5 min). Subsequent runs reuse the cache.
@@ -85,12 +85,16 @@ _eval_image = (
         "pillow>=9.0.0",
     )
     .run_commands(
-        # Pre-bake YOLO weights so cold-starts don't re-download ~52 MB.
+        # Pre-bake detection weights so cold-starts don't re-download.
         'python -c "from ultralytics import YOLO; YOLO(\'yolov8m.pt\')"',
     )
     .add_local_file(
         str(_WEIGHTS_DIR / "osnet_x0_25_msmt17.pt"),
         "/weights/osnet_x0_25_msmt17.pt",
+    )
+    .add_local_file(
+        str(_WEIGHTS_DIR / "yolo26m-pose.pt"),
+        "/weights/yolo26m-pose.pt",
     )
     .add_local_python_source(
         "padeldet",
@@ -193,6 +197,7 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
     t0 = time.time()
     config = PlayerTrackerConfig(
         model_path="yolov8m.pt",
+        pose_model_path="/weights/yolo26m-pose.pt",
         confidence=0.1,
         iou_threshold=0.1,
         imgsz=960,
@@ -208,7 +213,7 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
 
     if annotate_video:
         t_ann = time.time()
-        out_path = f"{_MOUNT}/modal_player_output.mp4"
+        out_path = f"{_MOUNT}/player_output.mp4"
         frame_lookup = {fd.frame_index: fd for fd in player_results}
         last_fd = None
         abs_idx = start
@@ -219,6 +224,7 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
                 if last_fd is not None:
                     annotated = last_fd.draw(frame)
                     for det in last_fd.detections:
+                        _draw_skeleton(annotated, det)
                         if det.ankle_midpoint is not None:
                             ax, ay = int(det.ankle_midpoint[0]), int(det.ankle_midpoint[1])
                             cv2.circle(annotated, (ax, ay), 6, (0, 0, 255), -1)
@@ -233,7 +239,7 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
     else:
         annotation_duration_s = 0
 
-    save_detections(player_results, f"{_MOUNT}/modal_player_detections.json")
+    save_detections(player_results, f"{_MOUNT}/player_detections.json")
 
     # Per-frame stats.
     counts = [len(fd) for fd in player_results]
@@ -258,12 +264,40 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
         try:
             from padeldet.metrics.compute import compute_metrics
             metrics = compute_metrics(player_results, court_projection, video_info.fps)
-            metrics.save(f"{_MOUNT}/modal_metrics.json")
+            metrics.save(f"{_MOUNT}/metrics.json")
             report["metrics_saved"] = True
         except Exception as e:
             report["metrics_error"] = str(e)
 
     return report
+
+
+_COCO_SKELETON = [
+    (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),   # arms
+    (5, 11), (6, 12), (11, 12),                  # torso
+    (11, 13), (13, 15), (12, 14), (14, 16),      # legs
+]
+
+
+def _draw_skeleton(frame, det, min_conf: float = 0.3) -> None:
+    import cv2
+    if det.keypoints is None:
+        return
+    kps = det.keypoints
+    for a, b in _COCO_SKELETON:
+        if a >= len(kps) or b >= len(kps):
+            continue
+        xa, ya, ca = kps[a]
+        xb, yb, cb = kps[b]
+        if ca < min_conf or cb < min_conf:
+            continue
+        if (xa == 0.0 and ya == 0.0) or (xb == 0.0 and yb == 0.0):
+            continue
+        cv2.line(frame, (int(xa), int(ya)), (int(xb), int(yb)), (0, 255, 0), 2, cv2.LINE_AA)
+    for x, y, c in kps:
+        if c < min_conf or (x == 0.0 and y == 0.0):
+            continue
+        cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1, cv2.LINE_AA)
 
 
 def _run_ball(video_path, video_info, court_projection, start, end):
@@ -285,14 +319,14 @@ def _run_ball(video_path, video_info, court_projection, start, end):
     frames = frame_generator(video_path, start=start, end=end)
     ball_results = ball_tracker.run(frames, start_frame=start)
 
-    out_path = f"{_MOUNT}/modal_ball_output.mp4"
+    out_path = f"{_MOUNT}/ball_output.mp4"
     trail_length = 15
     with VideoWriter(out_path, video_info) as writer:
         for i, frame in enumerate(frame_generator(video_path, start=start, end=end)):
             frame = _draw_ball_trail(frame, ball_results, i, trail_length)
             writer.write(frame)
 
-    save_detections(ball_results, f"{_MOUNT}/modal_ball_detections.json")
+    save_detections(ball_results, f"{_MOUNT}/ball_detections.json")
 
     detected = sum(
         1 for fd in ball_results
@@ -389,7 +423,7 @@ def main(
         print(f"Video is {size_mb:.1f} MB — uploading to Modal volume via CLI...")
         import subprocess
         subprocess.run(
-            ["modal", "volume", "put", "padel-eval-videos", str(video_path), video_filename],
+            ["modal", "volume", "put", "--force", "padel-eval-videos", str(video_path), video_filename],
             check=True,
         )
         print("Upload done.")
@@ -415,14 +449,14 @@ def main(
     output_files: list[str] = []
     if strategy in ("player", "all"):
         if not no_video:
-            output_files.append("modal_player_output.mp4")
-        output_files.append("modal_player_detections.json")
+            output_files.append("player_output.mp4")
+        output_files.append("player_detections.json")
         if keypoints_dict is not None:
-            output_files.append("modal_metrics.json")
+            output_files.append("metrics.json")
     if strategy in ("ball", "all"):
         if not no_video:
-            output_files.append("modal_ball_output.mp4")
-        output_files.append("modal_ball_detections.json")
+            output_files.append("ball_output.mp4")
+        output_files.append("ball_detections.json")
 
     print("\nDownloading outputs...")
     for filename in output_files:
