@@ -76,6 +76,7 @@ class TrackedDetection(Detection):
     logical_player_id: int | None = None
     visible: bool = True
     ankle_midpoint: tuple[float, float] | None = None
+    keypoints: list[tuple[float, float, float]] | None = None  # (x, y, conf) per COCO keypoint — 17 joints in COCO order
 
     def serialize(self) -> dict:
         data = super().serialize()
@@ -84,12 +85,18 @@ class TrackedDetection(Detection):
         data["logical_player_id"] = self.logical_player_id
         data["visible"] = self.visible
         data["ankle_midpoint"] = [float(self.ankle_midpoint[0]), float(self.ankle_midpoint[1])] if self.ankle_midpoint is not None else None
+        data["keypoints"] = (
+            [[kp[0], kp[1], kp[2]] for kp in self.keypoints]
+            if self.keypoints is not None else None
+        )
         return data
 
     @classmethod
     def from_dict(cls, d: dict) -> TrackedDetection:
         cp = d.get("court_position")
         amp = d.get("ankle_midpoint")
+        raw_kps = d.get("keypoints")
+        keypoints = [tuple(kp) for kp in raw_kps] if raw_kps is not None else None
         return cls(
             bbox=BoundingBox(*d["bbox"]),
             confidence=d["confidence"],
@@ -100,6 +107,7 @@ class TrackedDetection(Detection):
             logical_player_id=d.get("logical_player_id"),
             visible=d.get("visible", True),
             ankle_midpoint=tuple(amp) if amp is not None else None,
+            keypoints=keypoints,
         )
 
 
