@@ -114,6 +114,8 @@ class LogicalPlayerManager:
     def __init__(self, config: PlayerTrackerConfig):
         self.config = config
         self.states: list[LogicalPlayerState] = []
+        self.team1_side: Literal["near", "far"] = "near"
+        self._side_change_allowed: bool = False
 
     def initialize(
         self,
@@ -196,7 +198,8 @@ class LogicalPlayerManager:
                 missing_states.append(state)
 
         if not missing_states:
-            return FrameDetections(frame_index=fd.frame_index, detections=result_dets)
+            self._update_team_sides(result_dets)
+            return self._make_frame_detections(fd.frame_index, result_dets)
 
         unassigned = [
             d for d in fd.detections
@@ -238,7 +241,52 @@ class LogicalPlayerManager:
             else:
                 self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
 
-        return FrameDetections(frame_index=fd.frame_index, detections=result_dets)
+        self._update_team_sides(result_dets)
+        return self._make_frame_detections(fd.frame_index, result_dets)
+
+    def _make_frame_detections(self, frame_index: int, result_dets: list[TrackedDetection]) -> FrameDetections:
+        fd_out = FrameDetections(frame_index=frame_index, detections=result_dets)
+        fd_out.team_sides = {
+            1: self.team1_side,
+            2: "far" if self.team1_side == "near" else "near",
+        }
+        return fd_out
+
+    def _update_team_sides(self, result_dets: list[TrackedDetection]) -> None:
+        if not self._side_change_allowed:
+            return
+
+        in_court = [d for d in result_dets if d.is_on_court and d.court_position is not None]
+        team1_ids, team2_ids = {1, 2}, {3, 4}
+
+        team1_near = any(d.court_position[1] < COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team1_ids)
+        team1_far  = any(d.court_position[1] >= COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team1_ids)
+        team2_near = any(d.court_position[1] < COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team2_ids)
+        team2_far  = any(d.court_position[1] >= COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team2_ids)
+
+        if team1_far and not team2_far:
+            if self.team1_side != "far":
+                logging.info("Team side change detected: Team 1 → far, Team 2 → near")
+                self._flip_state_team_sides()
+            self.team1_side = "far"
+            self._side_change_allowed = False
+        elif team1_near and not team2_near:
+            if self.team1_side != "near":
+                logging.info("Team side change detected: Team 1 → near, Team 2 → far")
+                self._flip_state_team_sides()
+            self.team1_side = "near"
+            self._side_change_allowed = False
+
+    def _flip_state_team_sides(self) -> None:
+        for state in self.states:
+            if state.team_side == "near":
+                state.team_side = "far"
+            elif state.team_side == "far":
+                state.team_side = "near"
+            if state.play_side == "left":
+                state.play_side = "right"
+            elif state.play_side == "right":
+                state.play_side = "left"
 
     def _structural_assign(
         self,
@@ -377,6 +425,12 @@ class LogicalPlayerManager:
             exited_side = x < 0.0 or x > COURT_WIDTH
             near_door = DOOR_Y_MIN <= y <= DOOR_Y_MAX
             on_court = not (exited_side and near_door)
+            if state.is_on_court and not on_court:
+                self._side_change_allowed = True
+                logging.info(
+                    f"[frame {frame_index}] Side-change gate OPENED: "
+                    f"logical_id={state.logical_id} exited court"
+                )
             state.is_on_court = on_court
             det.is_on_court = on_court
         state.last_bbox = det.bbox

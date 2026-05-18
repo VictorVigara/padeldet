@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 import supervision as sv
 
@@ -120,6 +121,7 @@ class FrameDetections:
 
     frame_index: int
     detections: list[TrackedDetection] = field(default_factory=list)
+    team_sides: dict[int, str] = field(default_factory=dict)  # {1: "near"/"far", 2: "near"/"far"}
 
     def __len__(self) -> int:
         return len(self.detections)
@@ -134,13 +136,16 @@ class FrameDetections:
         return {
             "frame_index": self.frame_index,
             "detections": [d.serialize() for d in self.detections],
+            "team_sides": {str(k): v for k, v in self.team_sides.items()},
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> FrameDetections:
+        raw_ts = d.get("team_sides", {})
         return cls(
             frame_index=d["frame_index"],
             detections=[TrackedDetection.from_dict(det) for det in d["detections"]],
+            team_sides={int(k): v for k, v in raw_ts.items()},
         )
 
     def to_sv_detections(self) -> sv.Detections:
@@ -207,6 +212,23 @@ class FrameDetections:
         frame = label_annotator.annotate(
             scene=frame, detections=sv_dets, labels=labels,
         )
+
+        if self.team_sides:
+            near_team = next((t for t, s in self.team_sides.items() if s == "near"), None)
+            far_team  = next((t for t, s in self.team_sides.items() if s == "far"), None)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale, thick = 0.9, 2
+            for label, anchor_y, align_bottom in [
+                (f"Team {far_team}",  30,      False),
+                (f"Team {near_team}", h - 15,  True),
+            ]:
+                if label.startswith("Team None"):
+                    continue
+                (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+                y0 = anchor_y - th - 4 if align_bottom else anchor_y - th
+                cv2.rectangle(frame, (5, y0 - 4), (5 + tw + 8, anchor_y + 4), (0, 0, 0), -1)
+                cv2.putText(frame, label, (9, anchor_y), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
         return frame
 
 
