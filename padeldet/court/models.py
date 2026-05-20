@@ -1,4 +1,18 @@
-"""Court keypoint data model and court dimensions."""
+"""Court keypoint data model and padel-rule constants.
+
+Court dimensions (width, length, net position, door y-band) are NOT defined
+here — they depend on the match type (doubles vs singles) and live in
+`padeldet.match_profile`. They are carried at runtime by `CourtProjection`
+instances (width_m, length_m, net_y, door_y_min, door_y_max).
+
+This module only owns:
+  * the 12-point keypoint schema (`COURT_KEYPOINT_NAMES`)
+  * padel-rule constants that don't vary with court size
+    (`SERVICE_BOX_DEPTH`, `DOOR_HALF_WIDTH_M`)
+  * `build_keypoints_2d(width_m, length_m)` — the factory that produces the
+    2D reference layout for a given court size
+  * the `CourtKeypoints` dataclass (pixel keypoints only)
+"""
 
 from __future__ import annotations
 
@@ -6,17 +20,11 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-# ── Court real-world dimensions (meters) ─────────────────────────────
-COURT_WIDTH = 10.0       # baseline width
-COURT_LENGTH = 20.0      # sideline length
-SERVICE_BOX_DEPTH = 3.0  # from baseline to service line
-NET_POSITION = 10.0      # from near baseline to net (center of court)
-
+# ── Padel-rule constants (same for doubles and singles) ──────────────
+SERVICE_BOX_DEPTH = 3.0       # meters from baseline to service line
 # Official padel door: 0.72 m wide, centered on the net line on each side wall.
 # ±2 m tolerance around the net absorbs detection noise during exit/entry.
 DOOR_HALF_WIDTH_M = 2.0
-DOOR_Y_MIN = NET_POSITION - DOOR_HALF_WIDTH_M   # 8.0 m
-DOOR_Y_MAX = NET_POSITION + DOOR_HALF_WIDTH_M   # 12.0 m
 
 # ── 12-point keypoint schema ─────────────────────────────────────────
 #
@@ -46,34 +54,33 @@ COURT_KEYPOINT_NAMES: list[tuple[str, str]] = [
     ("k12", "far baseline right"),
 ]
 
-# Standard 2D court coordinates in meters (origin at k1 = bottom-left).
-# Used as homography destination points.
-COURT_KEYPOINTS_2D: list[tuple[float, float]] = [
-    # k1: near baseline left
-    (0.0, 0.0),
-    # k2: near baseline right
-    (COURT_WIDTH, 0.0),
-    # k3: near service line left
-    (0.0, SERVICE_BOX_DEPTH),
-    # k4: near service line center
-    (COURT_WIDTH / 2, SERVICE_BOX_DEPTH),
-    # k5: near service line right
-    (COURT_WIDTH, SERVICE_BOX_DEPTH),
-    # k6: net left
-    (0.0, NET_POSITION),
-    # k7: net right
-    (COURT_WIDTH, NET_POSITION),
-    # k8: far service line left
-    (0.0, COURT_LENGTH - SERVICE_BOX_DEPTH),
-    # k9: far service line center
-    (COURT_WIDTH / 2, COURT_LENGTH - SERVICE_BOX_DEPTH),
-    # k10: far service line right
-    (COURT_WIDTH, COURT_LENGTH - SERVICE_BOX_DEPTH),
-    # k11: far baseline left
-    (0.0, COURT_LENGTH),
-    # k12: far baseline right
-    (COURT_WIDTH, COURT_LENGTH),
-]
+
+def build_keypoints_2d(
+    width_m: float,
+    length_m: float,
+    service_box_depth_m: float = SERVICE_BOX_DEPTH,
+) -> list[tuple[float, float]]:
+    """Build the 12-point 2D reference layout for a given court size.
+
+    Layout matches `COURT_KEYPOINT_NAMES`: origin at k1 (near baseline left),
+    +x to the right, +y towards the far baseline. The net sits at length_m/2.
+    """
+    net_y = length_m / 2
+    return [
+        (0.0, 0.0),                                       # k1
+        (width_m, 0.0),                                   # k2
+        (0.0, service_box_depth_m),                       # k3
+        (width_m / 2, service_box_depth_m),               # k4
+        (width_m, service_box_depth_m),                   # k5
+        (0.0, net_y),                                     # k6
+        (width_m, net_y),                                 # k7
+        (0.0, length_m - service_box_depth_m),            # k8
+        (width_m / 2, length_m - service_box_depth_m),    # k9
+        (width_m, length_m - service_box_depth_m),        # k10
+        (0.0, length_m),                                  # k11
+        (width_m, length_m),                              # k12
+    ]
+
 
 NUM_KEYPOINTS = len(COURT_KEYPOINT_NAMES)
 
@@ -83,6 +90,10 @@ class CourtKeypoints:
     """Court keypoints in pixel coordinates.
 
     Stores up to 12 keypoints. Missing keypoints are represented as None.
+    The 2D reference coordinates that pair with these pixel points depend on
+    the match type and are produced via `build_keypoints_2d(width_m, length_m)`;
+    use `pair_with_2d(reference_2d)` to align available pixel points with the
+    matching subset of a 2D reference layout.
     """
 
     points: list[tuple[float, float] | None]
@@ -102,13 +113,23 @@ class CourtKeypoints:
     def num_available(self) -> int:
         return len(self.available_indices)
 
-    def get_available_pairs(self) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-        """Return matched pairs of (pixel_points, court_2d_points) for available keypoints."""
-        pixel_pts = []
-        court_pts = []
+    def pair_with_2d(
+        self, reference_2d: list[tuple[float, float]]
+    ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Return matched (pixel_points, court_2d_points) for available indices.
+
+        `reference_2d` must be the 12-point layout produced by
+        `build_keypoints_2d` for the target court size.
+        """
+        if len(reference_2d) != NUM_KEYPOINTS:
+            raise ValueError(
+                f"reference_2d must have {NUM_KEYPOINTS} entries, got {len(reference_2d)}"
+            )
+        pixel_pts: list[tuple[float, float]] = []
+        court_pts: list[tuple[float, float]] = []
         for i in self.available_indices:
             pixel_pts.append(self.points[i])
-            court_pts.append(COURT_KEYPOINTS_2D[i])
+            court_pts.append(reference_2d[i])
         return pixel_pts, court_pts
 
     def serialize(self) -> dict:

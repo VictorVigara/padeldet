@@ -1,35 +1,40 @@
-"""Zone classification, formation detection, net approaches, and heatmaps."""
+"""Zone classification, formation detection, net approaches, and heatmaps.
+
+Court dimensions are passed in by callers (typically from a `CourtProjection`
+built from the active `MatchProfile`) so the same logic works for doubles
+(10 × 20 m) and singles (6 × 20 m) courts.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 
-from ..court.models import COURT_LENGTH, COURT_WIDTH, SERVICE_BOX_DEPTH
+from ..court.models import SERVICE_BOX_DEPTH
 from .models import Formation, PlayerTrack, Zone
 
 
 # Zone boundaries in meters from the respective baseline
 # Net zone: 0 to SERVICE_BOX_DEPTH (3m)
 # Transition zone: 3m to 7m
-# Back zone: 7m to 10m (half court)
+# Back zone: 7m to half-length
 _ZONE_NET_MAX = SERVICE_BOX_DEPTH  # 3m
 _ZONE_TRANSITION_MAX = 7.0  # 7m
 
 
-def classify_zone(y: float, team: str) -> Zone:
+def classify_zone(y: float, team: str, length_m: float) -> Zone:
     """Classify a court Y position into a zone relative to the team's side.
 
-    Near team plays on Y=0..10 (baseline at 0, net at 10).
-    Far team plays on Y=10..20 (net at 10, baseline at 20).
+    Near team plays on Y=0..length_m/2 (baseline at 0, net at length_m/2).
+    Far team plays on Y=length_m/2..length_m (net at length_m/2, baseline at length_m).
     Distance from baseline determines the zone.
     """
     if team == "near":
         dist_from_baseline = y  # baseline is at Y=0
     else:
-        dist_from_baseline = COURT_LENGTH - y  # baseline is at Y=20
+        dist_from_baseline = length_m - y  # baseline is at Y=length_m
 
     # Clamp to valid range
-    dist_from_baseline = max(0.0, min(dist_from_baseline, COURT_LENGTH / 2))
+    dist_from_baseline = max(0.0, min(dist_from_baseline, length_m / 2))
 
     if dist_from_baseline >= _ZONE_TRANSITION_MAX:
         return Zone.NET
@@ -39,9 +44,11 @@ def classify_zone(y: float, team: str) -> Zone:
         return Zone.BACK
 
 
-def compute_zone_distribution(track: PlayerTrack, team: str) -> dict[str, float]:
+def compute_zone_distribution(
+    track: PlayerTrack, team: str, length_m: float
+) -> dict[str, float]:
     """Fraction of time spent in each zone."""
-    zones = [classify_zone(float(y), team) for y in track.y]
+    zones = [classify_zone(float(y), team, length_m) for y in track.y]
     n = len(zones)
     if n == 0:
         return {z.value: 0.0 for z in Zone}
@@ -56,6 +63,7 @@ def compute_formation_timeline(
     track_a: PlayerTrack,
     track_b: PlayerTrack,
     team: str,
+    length_m: float,
 ) -> list[Formation]:
     """Classify team formation for each frame where both players are present.
 
@@ -69,8 +77,8 @@ def compute_formation_timeline(
 
     timeline: list[Formation] = []
     for f in common_frames:
-        zone_a = classify_zone(a_pos[f], team)
-        zone_b = classify_zone(b_pos[f], team)
+        zone_a = classify_zone(a_pos[f], team, length_m)
+        zone_b = classify_zone(b_pos[f], team, length_m)
 
         if zone_a == Zone.NET and zone_b == Zone.NET:
             timeline.append(Formation.BOTH_AT_NET)
@@ -97,6 +105,7 @@ def compute_formation_distribution(timeline: list[Formation]) -> dict[str, float
 def count_net_approaches(
     track: PlayerTrack,
     team: str,
+    length_m: float,
     min_frames_in_zone: int = 5,
 ) -> int:
     """Count transitions from back/transition zone to net zone.
@@ -104,7 +113,7 @@ def count_net_approaches(
     Only counts if the player stays in the net zone for at least
     min_frames_in_zone consecutive frames (filters noise).
     """
-    zones = [classify_zone(float(y), team) for y in track.y]
+    zones = [classify_zone(float(y), team, length_m) for y in track.y]
     count = 0
     i = 0
     n = len(zones)
@@ -130,6 +139,8 @@ def count_net_approaches(
 
 def compute_position_heatmap(
     track: PlayerTrack,
+    width_m: float,
+    length_m: float,
     x_bins: int = 20,
     y_bins: int = 40,
 ) -> np.ndarray:
@@ -138,7 +149,7 @@ def compute_position_heatmap(
         track.x,
         track.y,
         bins=[x_bins, y_bins],
-        range=[[0, COURT_WIDTH], [0, COURT_LENGTH]],
+        range=[[0, width_m], [0, length_m]],
     )
     total = heatmap.sum()
     if total > 0:

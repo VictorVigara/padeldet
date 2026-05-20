@@ -7,7 +7,6 @@ import logging
 import numpy as np
 import supervision as sv
 
-from ..court.models import COURT_LENGTH, COURT_WIDTH
 from ..court.projection import CourtProjection
 from ..models import FrameDetections, TrackedDetection
 from .config import PlayerTrackerConfig
@@ -60,14 +59,15 @@ def is_court_point_valid(
 ) -> bool:
     """Check if a court-meter point is within court bounds + margin.
 
-    Court origin is at the near-baseline-left corner:
-        x: 0..COURT_WIDTH (10 m)
-        y: 0..COURT_LENGTH (20 m)
+    Court origin is at the near-baseline-left corner; dimensions come from
+    the projection (doubles 10 × 20 m, singles 6 × 20 m).
     """
     if court_projection is None:
         return True
     x, y = float(court_pt[0]), float(court_pt[1])
-    return (-margin_m <= x <= COURT_WIDTH + margin_m) and (-margin_m <= y <= COURT_LENGTH + margin_m)
+    width_m = court_projection.width_m
+    length_m = court_projection.length_m
+    return (-margin_m <= x <= width_m + margin_m) and (-margin_m <= y <= length_m + margin_m)
 
 
 def detection_is_valid_box_xyxy(

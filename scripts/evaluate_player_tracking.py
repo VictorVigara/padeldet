@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from padeldet.court.models import CourtKeypoints
 from padeldet.court.projection import CourtProjection, draw_mini_court
+from padeldet.match_profile import MATCH_PROFILES
 from padeldet.models import save_detections
 from padeldet.player_tracker import PlayerTracker, PlayerTrackerConfig
 from padeldet.video import VideoInfo, VideoWriter, frame_generator
@@ -43,6 +44,8 @@ def parse_args():
     parser.add_argument("--pose-model",
                         default="yolo26m-pose.pt",
                         help="YOLO pose model for ankle midpoint extraction")
+    parser.add_argument("--match-type", default="doubles", choices=["doubles", "singles"],
+                        help="Match type — selects player count + court dimensions (default: doubles)")
     args = parser.parse_args()
 
     # Fill in defaults relative to the video folder
@@ -59,7 +62,7 @@ def parse_args():
     return args
 
 
-def print_stats(results, court_projection=None, video_fps=None, stride=1):
+def print_stats(results, court_projection=None, video_fps=None, stride=1, n_players=4):
     """Print detection statistics."""
     counts = [len(fd) for fd in results]
     confidences = [
@@ -79,8 +82,8 @@ def print_stats(results, court_projection=None, video_fps=None, stride=1):
         print(f"Confidence — min: {min(confidences):.3f}, avg: {sum(confidences)/len(confidences):.3f}, max: {max(confidences):.3f}")
 
     # Frames with unexpected player count
-    not_four = sum(1 for c in counts if c != 4)
-    print(f"Frames with != 4 players: {not_four}/{len(results)} ({100*not_four/len(results):.1f}%)")
+    wrong_count = sum(1 for c in counts if c != n_players)
+    print(f"Frames with != {n_players} players: {wrong_count}/{len(results)} ({100*wrong_count/len(results):.1f}%)")
 
     # Distribution of detection counts
     from collections import Counter
@@ -96,7 +99,7 @@ def print_stats(results, court_projection=None, video_fps=None, stride=1):
         for d in fd.detections:
             if d.track_id is not None:
                 all_ids.add(d.track_id)
-    print(f"\nUnique track IDs seen: {len(all_ids)} (ideal: 4)")
+    print(f"\nUnique track IDs seen: {len(all_ids)} (ideal: {n_players})")
     if all_ids:
         print(f"  IDs: {sorted(all_ids)}")
 
@@ -130,15 +133,26 @@ def main():
     print(f"  FPS: {video_info.fps}")
     print(f"  Frames: {video_info.total_frames}")
 
+    profile = MATCH_PROFILES[args.match_type]
+    print(
+        f"Match type: {args.match_type} "
+        f"({profile.n_players} players on {profile.court.width_m:.1f}×{profile.court.length_m:.1f} m)"
+    )
+
     # Load court keypoints if provided
     court_projection = None
     if args.court_keypoints:
         keypoints = CourtKeypoints.load(args.court_keypoints)
-        court_projection = CourtProjection(keypoints)
+        court_projection = CourtProjection(
+            keypoints,
+            width_m=profile.court.width_m,
+            length_m=profile.court.length_m,
+        )
         print(f"\nCourt keypoints loaded: {keypoints.num_available}/12 points")
 
     # Set up tracker
     config = PlayerTrackerConfig(
+        match_type=args.match_type,
         model_path=args.model,
         confidence=args.confidence,
         batch_size=args.batch_size,
@@ -165,7 +179,10 @@ def main():
     results = tracker.run(frames, start_frame=args.start, stride=stride)
 
     # Print stats
-    print_stats(results, court_projection, video_fps=video_info.fps, stride=stride)
+    print_stats(
+        results, court_projection,
+        video_fps=video_info.fps, stride=stride, n_players=profile.n_players,
+    )
 
     # Save annotated video
     print(f"\nWriting annotated video to: {args.output}")

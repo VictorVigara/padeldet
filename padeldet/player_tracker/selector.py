@@ -1,4 +1,4 @@
-"""Interactive OpenCV window for manually selecting 4 player track IDs."""
+"""Interactive OpenCV window for manually selecting player track IDs."""
 
 from __future__ import annotations
 
@@ -9,18 +9,24 @@ from ..models import FrameDetections
 
 
 class PlayerSelectorUI:
-    """Interactive OpenCV window for manually selecting 4 player track IDs."""
+    """Interactive OpenCV window for manually selecting `n_players` track IDs."""
 
     _MAX_CLICK_DIST = 100  # pixels — ignore clicks far from any detection
 
-    def __init__(self, frame: np.ndarray, detections: FrameDetections):
+    def __init__(
+        self,
+        frame: np.ndarray,
+        detections: FrameDetections,
+        n_players: int = 4,
+    ):
         self._frame = frame
         self._detections = detections
+        self._n_players = n_players
         self._selected: list[int] = []
 
     def select(self) -> list[int]:
-        """Block until user selects exactly 4 players. Returns track_ids in click order."""
-        win = "Select 4 players - click each player"
+        """Block until user selects exactly `n_players` players. Returns track_ids in click order."""
+        win = f"Select {self._n_players} players - click each player"
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(win, 1280, 720)
         cv2.setMouseCallback(win, self._mouse_callback)
@@ -28,7 +34,7 @@ class PlayerSelectorUI:
             cv2.imshow(win, self._draw())
             key = cv2.waitKey(30) & 0xFF
             if key in (13, 10):  # ENTER
-                if len(self._selected) == 4:
+                if len(self._selected) == self._n_players:
                     break
             elif key in (8, 127):  # BACKSPACE / DEL
                 if self._selected:
@@ -36,7 +42,8 @@ class PlayerSelectorUI:
             elif key == 27:  # ESC
                 cv2.destroyWindow(win)
                 raise RuntimeError(
-                    "Player selection cancelled. Select exactly 4 players and press ENTER."
+                    f"Player selection cancelled. Select exactly {self._n_players} "
+                    "players and press ENTER."
                 )
         cv2.destroyWindow(win)
         return list(self._selected)
@@ -67,8 +74,8 @@ class PlayerSelectorUI:
             )
         bar = np.zeros((36, w, 3), dtype=np.uint8)
         msg = (
-            f"Selected: {len(self._selected)}/4"
-            "    BACKSPACE: undo    ENTER: confirm (need 4)"
+            f"Selected: {len(self._selected)}/{self._n_players}"
+            f"    BACKSPACE: undo    ENTER: confirm (need {self._n_players})"
         )
         cv2.putText(bar, msg, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
         return np.vstack([img, bar])
@@ -81,7 +88,7 @@ class PlayerSelectorUI:
             return
         if tid in self._selected:
             self._selected.remove(tid)
-        elif len(self._selected) < 4:
+        elif len(self._selected) < self._n_players:
             self._selected.append(tid)
 
     def _find_nearest_track(self, x: int, y: int) -> int | None:

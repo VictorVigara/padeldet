@@ -77,6 +77,9 @@ def compute_metrics(
     teams = assign_teams(tracks, config.team_init_frames)
     print(f"Teams — near: {teams.near_team}, far: {teams.far_team}")
 
+    width_m = projection.width_m
+    length_m = projection.length_m
+
     # 3. Per-player metrics
     player_results: list[PlayerMetricsResult] = []
     for tid, track in sorted(tracks.items()):
@@ -91,25 +94,25 @@ def compute_metrics(
                 avg_speed_ms=float(np.mean(speeds)) if len(speeds) > 0 else 0.0,
                 max_speed_ms=float(np.max(speeds)) if len(speeds) > 0 else 0.0,
                 speed_distribution=compute_speed_distribution(speeds),
-                zone_distribution=compute_zone_distribution(track, team),
+                zone_distribution=compute_zone_distribution(track, team, length_m),
                 net_approaches=count_net_approaches(
-                    track, team, config.net_approach_min_frames
+                    track, team, length_m, config.net_approach_min_frames
                 ),
                 position_heatmap=compute_position_heatmap(
-                    track, config.heatmap_x_bins, config.heatmap_y_bins
+                    track, width_m, length_m, config.heatmap_x_bins, config.heatmap_y_bins
                 ).tolist(),
             )
         )
 
-    # 4. Per-team metrics
+    # 4. Per-team metrics — formation timeline requires 2 players per team (doubles only)
     team_results: list[TeamMetricsResult] = []
     for team_name, player_ids in [
         ("near", teams.near_team),
         ("far", teams.far_team),
     ]:
-        if player_ids[0] in tracks and player_ids[1] in tracks:
+        if len(player_ids) >= 2 and player_ids[0] in tracks and player_ids[1] in tracks:
             timeline = compute_formation_timeline(
-                tracks[player_ids[0]], tracks[player_ids[1]], team_name
+                tracks[player_ids[0]], tracks[player_ids[1]], team_name, length_m
             )
             team_results.append(
                 TeamMetricsResult(

@@ -160,10 +160,17 @@ def run_eval(
     print(f"Video: {video_filename}  {video_info.width}x{video_info.height} @ {video_info.fps:.1f} fps  ({video_info.total_frames} frames)")
     print(f"Detection: stride={stride} → {effective_fps:.1f} fps")
 
+    from padeldet.match_profile import MATCH_PROFILES
+    profile = MATCH_PROFILES["doubles"]
+
     court_projection = None
     if keypoints_dict is not None:
         keypoints = CourtKeypoints.from_dict(keypoints_dict)
-        court_projection = CourtProjection(keypoints)
+        court_projection = CourtProjection(
+            keypoints,
+            width_m=profile.court.width_m,
+            length_m=profile.court.length_m,
+        )
         print(f"Court projection loaded ({keypoints.num_available}/12 keypoints)")
 
     report: dict = {}
