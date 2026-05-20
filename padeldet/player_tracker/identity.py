@@ -8,7 +8,7 @@ from typing import Literal
 
 import numpy as np
 
-from ..court.models import COURT_LENGTH, COURT_WIDTH
+from ..court.models import COURT_LENGTH, COURT_WIDTH, DOOR_Y_MAX, DOOR_Y_MIN
 from ..models import BoundingBox, FrameDetections, TrackedDetection
 from .config import PlayerTrackerConfig
 
@@ -23,35 +23,61 @@ def _team_side(court_position: np.ndarray | None) -> Literal["near", "far"] | No
     return "near" if court_position[1] < COURT_LENGTH / 2 else "far"
 
 
-def _play_side(court_position: np.ndarray | None) -> Literal["left", "right"] | None:
+def _team_side_with_deadzone(
+    court_position: np.ndarray | None,
+    deadzone_m: float,
+) -> Literal["near", "far"] | None:
+    """Like `_team_side` but returns None inside a ±deadzone band around the net."""
     if court_position is None:
         return None
-    return "left" if court_position[0] < COURT_WIDTH / 2 else "right"
-
-
-def _detection_team_side(det: TrackedDetection) -> Literal["near", "far"] | None:
-    if det.court_position is None:
+    y = float(court_position[1])
+    if abs(y - COURT_LENGTH / 2) < deadzone_m:
         return None
-    return _team_side(np.array(det.court_position, dtype=float))
+    return "near" if y < COURT_LENGTH / 2 else "far"
 
 
-def _detection_play_side(det: TrackedDetection) -> Literal["left", "right"] | None:
-    if det.court_position is None:
+def _play_side(
+    court_position: np.ndarray | None,
+    team_side: Literal["near", "far"] | None,
+) -> Literal["left", "right"] | None:
+    """Return the player's own left/right given their court position and team side.
+
+    Near players face the camera, so their own-left = camera-left (low court x).
+    Far players face away from the camera, so their own-left = camera-right (high x).
+    """
+    if court_position is None or team_side is None:
         return None
-    return _play_side(np.array(det.court_position, dtype=float))
+    cam_left = court_position[0] < COURT_WIDTH / 2
+    own_left = cam_left if team_side == "near" else not cam_left
+    return "left" if own_left else "right"
 
 
-def _same_role(state: LogicalPlayerState, det: TrackedDetection) -> bool:
-    return (
-        state.team_side is not None
-        and state.play_side is not None
-        and _detection_team_side(det) == state.team_side
-        and _detection_play_side(det) == state.play_side
+def _same_role(
+    state: LogicalPlayerState,
+    det: TrackedDetection,
+    deadzone_m: float,
+) -> bool:
+    if det.court_position is None or state.team_side is None or state.play_side is None:
+        return False
+    pos = np.array(det.court_position, dtype=float)
+    det_team = _team_side_with_deadzone(pos, deadzone_m)
+    if det_team is None:
+        return False
+    det_play = _play_side(pos, det_team)
+    return det_team == state.team_side and det_play == state.play_side
+
+
+def _same_team_side(
+    state: LogicalPlayerState,
+    det: TrackedDetection,
+    deadzone_m: float,
+) -> bool:
+    if det.court_position is None or state.team_side is None:
+        return False
+    det_team = _team_side_with_deadzone(
+        np.array(det.court_position, dtype=float), deadzone_m
     )
-
-
-def _same_team_side(state: LogicalPlayerState, det: TrackedDetection) -> bool:
-    return state.team_side is not None and _detection_team_side(det) == state.team_side
+    return det_team == state.team_side
 
 
 def _court_depth(court_position: np.ndarray) -> float:
@@ -60,18 +86,37 @@ def _court_depth(court_position: np.ndarray) -> float:
     return min(x, COURT_WIDTH - x, y, COURT_LENGTH - y)
 
 
-def _position_sort_key(det: TrackedDetection) -> tuple[int, int]:
-    """Sort key mapping a detection to a position bucket.
+def _is_valid_player_position(court_position: tuple[float, float]) -> bool:
+    """Return True if a court-meter position is acceptable for player assignment.
 
-    Bucket order: (team_side, play_side) → near-left=0, near-right=1, far-left=2, far-right=3.
+    Accepts positions inside the court or exiting through a side door.
+    Rejects anything else (spectator behind far/near glass, positional noise).
+    """
+    x, y = float(court_position[0]), float(court_position[1])
+    in_court = 0.0 <= x <= COURT_WIDTH and 0.0 <= y <= COURT_LENGTH
+    door_exit = (x < 0.0 or x > COURT_WIDTH) and DOOR_Y_MIN <= y <= DOOR_Y_MAX
+    return in_court or door_exit
+
+
+def _position_sort_key(det: TrackedDetection) -> tuple[int, int]:
+    """Sort key mapping a detection to a position bucket using player-relative L/R.
+
+    Bucket order: (team_side, own_play_side) → 0..3.
+    Near players face the camera, so own-left = camera-left (low court x).
+    Far players face away from the camera, so own-left = camera-right (high x).
     When detections are sorted by this key and assigned IDs 1-4 in order the result is:
-      ID 1 → near-left, ID 2 → near-right, ID 3 → far-left, ID 4 → far-right.
+      ID 1 → near-own-left, ID 2 → near-own-right,
+      ID 3 → far-own-left,  ID 4 → far-own-right.
     """
     if det.court_position is None:
         return (1, 1)
     x, y = det.court_position
-    team_bucket = 0 if y < COURT_LENGTH / 2 else 1
-    side_bucket = 0 if x < COURT_WIDTH / 2 else 1
+    if y < COURT_LENGTH / 2:
+        team_bucket = 0
+        side_bucket = 0 if x < COURT_WIDTH / 2 else 1
+    else:
+        team_bucket = 1
+        side_bucket = 0 if x >= COURT_WIDTH / 2 else 1
     return (team_bucket, side_bucket)
 
 
@@ -89,6 +134,7 @@ class LogicalPlayerState:
     play_side: Literal["left", "right"] | None
     last_seen_frame: int
     missing_frames: int = 0  # for logging/debugging only, not used for assignment gating
+    is_on_court: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +147,8 @@ class LogicalPlayerManager:
     def __init__(self, config: PlayerTrackerConfig):
         self.config = config
         self.states: list[LogicalPlayerState] = []
+        self.team1_side: Literal["near", "far"] = "near"
+        self._side_change_allowed: bool = False
 
     def initialize(
         self,
@@ -109,8 +157,9 @@ class LogicalPlayerManager:
     ) -> None:
         """Create logical players 1..4 from selected detections.
 
-        IDs are assigned by court quadrant regardless of input order:
-        1=near-left, 2=near-right, 3=far-left, 4=far-right.
+        IDs are assigned by court quadrant regardless of input order, using each
+        player's own left/right (far players face away from the camera):
+        1=near-own-left, 2=near-own-right, 3=far-own-left, 4=far-own-right.
         """
         selected_detections = sorted(selected_detections, key=_position_sort_key)
         self.states = []
@@ -120,14 +169,15 @@ class LogicalPlayerManager:
                 if det.court_position is not None
                 else None
             )
+            team_side = _team_side(court_pos)
             self.states.append(
                 LogicalPlayerState(
                     logical_id=i + 1,
                     current_track_id=det.track_id,
                     last_bbox=det.bbox,
                     last_court_position=court_pos,
-                    team_side=_team_side(court_pos),
-                    play_side=_play_side(court_pos),
+                    team_side=team_side,
+                    play_side=_play_side(court_pos, team_side),
                     last_seen_frame=frame_index,
                 )
             )
@@ -152,14 +202,21 @@ class LogicalPlayerManager:
         matched_lids: set[int] = set()
 
         # Step 1: direct track_id matching
-        # Trust DeepOCSORT's ReID here unconditionally — if the same track_id comes
-        # back, the tracker has visual evidence it's the same person. The court-edge
-        # depth filter only applies in Steps 2-5, where we're blindly assigning a
-        # new track_id to a logical player by position/role.
+        # ReID gives strong evidence, but we still validate court position to reject
+        # cases where the tracker incorrectly re-uses a player's track_id on a spectator.
+        # Accept only if the detection is inside the court OR exiting through a door.
+        # Any other out-of-bounds position (e.g. spectator behind far glass, y > COURT_LENGTH)
+        # is rejected — the player stays missing and falls through to Steps 2-5.
         min_depth = self.config.min_direct_match_court_depth_m
         for state in self.states:
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
+                if det.court_position is not None and not _is_valid_player_position(det.court_position):
+                    logging.debug(
+                        f"[frame {frame_index}] direct_track_id rejected (invalid position "
+                        f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                    )
+                    continue
                 assigned_tids.add(state.current_track_id)
                 matched_lids.add(state.logical_id)
                 self._assign(state, det, frame_index, "direct_track_id", result_dets, assigned_tids)
@@ -176,7 +233,8 @@ class LogicalPlayerManager:
                 missing_states.append(state)
 
         if not missing_states:
-            return FrameDetections(frame_index=fd.frame_index, detections=result_dets)
+            self._update_team_sides(result_dets)
+            return self._make_frame_detections(fd.frame_index, result_dets)
 
         unassigned = [
             d for d in fd.detections
@@ -188,16 +246,18 @@ class LogicalPlayerManager:
             )
         ]
 
+        deadzone = self.config.net_deadzone_m
+
         # Step 2: role-based reassignment — symmetric uniqueness (same team_side + play_side)
         unassigned, missing_states = self._structural_assign(
             missing_states, unassigned, assigned_tids, result_dets, frame_index,
-            match_fn=_same_role, reason="same_role",
+            match_fn=lambda s, d: _same_role(s, d, deadzone), reason="same_role",
         )
 
         # Step 3: team-side reassignment — symmetric uniqueness (same team_side only)
         unassigned, missing_states = self._structural_assign(
             missing_states, unassigned, assigned_tids, result_dets, frame_index,
-            match_fn=_same_team_side, reason="same_team_side",
+            match_fn=lambda s, d: _same_team_side(s, d, deadzone), reason="same_team_side",
         )
 
         # Step 4: proximity fallback — nearest last-known court position
@@ -210,9 +270,59 @@ class LogicalPlayerManager:
         if len(missing_states) == 1 and len(unassigned) == 1:
             state = missing_states[0]
             det = unassigned[0]
-            self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
+            if det.court_position is not None and not _is_valid_player_position(det.court_position):
+                logging.debug(
+                    f"[frame {frame_index}] one_to_one_fallback rejected (invalid position "
+                    f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                )
+            else:
+                self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
 
-        return FrameDetections(frame_index=fd.frame_index, detections=result_dets)
+        self._update_team_sides(result_dets)
+        return self._make_frame_detections(fd.frame_index, result_dets)
+
+    def _make_frame_detections(self, frame_index: int, result_dets: list[TrackedDetection]) -> FrameDetections:
+        fd_out = FrameDetections(frame_index=frame_index, detections=result_dets)
+        fd_out.team_sides = {
+            1: self.team1_side,
+            2: "far" if self.team1_side == "near" else "near",
+        }
+        return fd_out
+
+    def _update_team_sides(self, result_dets: list[TrackedDetection]) -> None:
+        if not self._side_change_allowed:
+            return
+
+        in_court = [d for d in result_dets if d.is_on_court and d.court_position is not None]
+        team1_ids, team2_ids = {1, 2}, {3, 4}
+
+        team1_near = any(d.court_position[1] < COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team1_ids)
+        team1_far  = any(d.court_position[1] >= COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team1_ids)
+        team2_near = any(d.court_position[1] < COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team2_ids)
+        team2_far  = any(d.court_position[1] >= COURT_LENGTH / 2 for d in in_court if d.logical_player_id in team2_ids)
+
+        # TODO: HEre is not checked if team2 left the court to enable a side change. So probably the method mentioned in _update_state_matched TODO would be better, which is to check if on court of one of the team players is true in a different side, and the players of the team occupying that side are not on court. This would allow to change sides during the match, and also to change back to the original side if needed.
+        if team1_far and not team2_far:
+            if self.team1_side != "far":
+                logging.info("Team side change detected: Team 1 → far, Team 2 → near")
+                self._flip_state_team_sides()
+            self.team1_side = "far"
+            self._side_change_allowed = False
+        elif team1_near and not team2_near:
+            if self.team1_side != "near":
+                logging.info("Team side change detected: Team 1 → near, Team 2 → far")
+                self._flip_state_team_sides()
+            self.team1_side = "near"
+            self._side_change_allowed = False
+
+    def _flip_state_team_sides(self) -> None:
+        # play_side is player-relative (own left/right), so it does not change
+        # when a team physically swaps court ends — only team_side flips.
+        for state in self.states:
+            if state.team_side == "near":
+                state.team_side = "far"
+            elif state.team_side == "far":
+                state.team_side = "near"
 
     def _structural_assign(
         self,
@@ -346,7 +456,23 @@ class LogicalPlayerManager:
             if state.team_side is None:
                 state.team_side = _team_side(new_court)
             if state.play_side is None:
-                state.play_side = _play_side(new_court)
+                state.play_side = _play_side(new_court, state.team_side)
+            x, y = float(new_court[0]), float(new_court[1])
+            exited_side = x < 0.0 or x > COURT_WIDTH
+            near_door = DOOR_Y_MIN <= y <= DOOR_Y_MAX
+            on_court = not (exited_side and near_door)
+            if state.is_on_court and not on_court:
+                # TODO: This is the only condition to allow side change. And even if the player comes back to the same
+                # court side, side change allowed is not set to False. Probably a player should have on_court. And then, allow
+                # the change if on court of one of the team players is true in a different side, and the players of the team occupying that 
+                # side are not on court. This would allow to change sides during the match, and also to change back to the original side if needed.
+                self._side_change_allowed = True
+                logging.info(
+                    f"[frame {frame_index}] Side-change gate OPENED: "
+                    f"logical_id={state.logical_id} exited court"
+                )
+            state.is_on_court = on_court
+            det.is_on_court = on_court
         state.last_bbox = det.bbox
         state.last_seen_frame = frame_index
         state.missing_frames = 0

@@ -12,6 +12,12 @@ COURT_LENGTH = 20.0      # sideline length
 SERVICE_BOX_DEPTH = 3.0  # from baseline to service line
 NET_POSITION = 10.0      # from near baseline to net (center of court)
 
+# Official padel door: 0.72 m wide, centered on the net line on each side wall.
+# ±2 m tolerance around the net absorbs detection noise during exit/entry.
+DOOR_HALF_WIDTH_M = 2.0
+DOOR_Y_MIN = NET_POSITION - DOOR_HALF_WIDTH_M   # 8.0 m
+DOOR_Y_MAX = NET_POSITION + DOOR_HALF_WIDTH_M   # 12.0 m
+
 # ── 12-point keypoint schema ─────────────────────────────────────────
 #
 # k11--------------------k12   (far baseline)

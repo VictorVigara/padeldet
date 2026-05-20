@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import cv2
 import numpy as np
 import supervision as sv
 
@@ -75,6 +76,7 @@ class TrackedDetection(Detection):
     court_position: tuple[float, float] | None = None
     logical_player_id: int | None = None
     visible: bool = True
+    is_on_court: bool = True
     ankle_midpoint: tuple[float, float] | None = None
     keypoints: list[tuple[float, float, float]] | None = None  # (x, y, conf) per COCO keypoint — 17 joints in COCO order
 
@@ -84,6 +86,7 @@ class TrackedDetection(Detection):
         data["court_position"] = list(self.court_position) if self.court_position is not None else None
         data["logical_player_id"] = self.logical_player_id
         data["visible"] = self.visible
+        data["is_on_court"] = self.is_on_court
         data["ankle_midpoint"] = [float(self.ankle_midpoint[0]), float(self.ankle_midpoint[1])] if self.ankle_midpoint is not None else None
         data["keypoints"] = (
             [[kp[0], kp[1], kp[2]] for kp in self.keypoints]
@@ -106,6 +109,7 @@ class TrackedDetection(Detection):
             court_position=tuple(cp) if cp is not None else None,
             logical_player_id=d.get("logical_player_id"),
             visible=d.get("visible", True),
+            is_on_court=d.get("is_on_court", True),
             ankle_midpoint=tuple(amp) if amp is not None else None,
             keypoints=keypoints,
         )
@@ -117,6 +121,7 @@ class FrameDetections:
 
     frame_index: int
     detections: list[TrackedDetection] = field(default_factory=list)
+    team_sides: dict[int, str] = field(default_factory=dict)  # {1: "near"/"far", 2: "near"/"far"}
 
     def __len__(self) -> int:
         return len(self.detections)
@@ -131,13 +136,16 @@ class FrameDetections:
         return {
             "frame_index": self.frame_index,
             "detections": [d.serialize() for d in self.detections],
+            "team_sides": {str(k): v for k, v in self.team_sides.items()},
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> FrameDetections:
+        raw_ts = d.get("team_sides", {})
         return cls(
             frame_index=d["frame_index"],
             detections=[TrackedDetection.from_dict(det) for det in d["detections"]],
+            team_sides={int(k): v for k, v in raw_ts.items()},
         )
 
     def to_sv_detections(self) -> sv.Detections:
@@ -197,11 +205,30 @@ class FrameDetections:
                     parts.append(f"#{det.track_id}")
             if show_confidence:
                 parts.append(f"{det.confidence:.2f}")
+            if not det.is_on_court:
+                parts.append("[OUT]")
             labels.append(" ".join(parts))
 
         frame = label_annotator.annotate(
             scene=frame, detections=sv_dets, labels=labels,
         )
+
+        if self.team_sides:
+            near_team = next((t for t, s in self.team_sides.items() if s == "near"), None)
+            far_team  = next((t for t, s in self.team_sides.items() if s == "far"), None)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale, thick = 0.9, 2
+            for label, anchor_y, align_bottom in [
+                (f"Team {far_team}",  30,      False),
+                (f"Team {near_team}", h - 15,  True),
+            ]:
+                if label.startswith("Team None"):
+                    continue
+                (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
+                y0 = anchor_y - th - 4 if align_bottom else anchor_y - th
+                cv2.rectangle(frame, (5, y0 - 4), (5 + tw + 8, anchor_y + 4), (0, 0, 0), -1)
+                cv2.putText(frame, label, (9, anchor_y), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+
         return frame
 
 

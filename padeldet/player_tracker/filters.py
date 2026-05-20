@@ -112,11 +112,6 @@ def filter_sv_detections_for_tracking(
         xyxy = sv_dets.xyxy[i]
         if not detection_is_valid_box_xyxy(xyxy, frame_shape, config):
             continue
-        if court_projection is not None:
-            foot = xyxy_foot_point(xyxy)
-            court_pt = project_foot_to_court(foot, court_projection)
-            if court_pt is None or not is_court_point_valid(court_pt, court_projection, config.court_margin_m):
-                continue
         mask[i] = True
 
     logging.debug(
