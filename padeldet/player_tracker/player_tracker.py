@@ -433,11 +433,13 @@ class PlayerTracker(Tracker):
         selected_tid_set = set(selected_track_ids)
         # Build tid→logical map from the identity manager so pre-selection frames
         # use the same position-sorted assignment as post-selection frames.
+        # For example, a current tracker id 13, can be mapped to logical player 2.
         tid_to_logical = {
             s.current_track_id: s.logical_id
             for s in identity_manager.states
             if s.current_track_id is not None
         }
+        
 
         # Phase 4: assign identities over init_results
         final_results: list[FrameDetections] = []

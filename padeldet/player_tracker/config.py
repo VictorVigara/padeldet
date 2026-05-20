@@ -56,6 +56,11 @@ class PlayerTrackerConfig:
     # accepted as a direct match — they fall through to structural reassignment instead.
     min_direct_match_court_depth_m: float = 0.05
     proximity_max_distance_m: float = 3.0
+    # Width (meters) of a band around the net line within which a detection's
+    # team side is treated as unknown for reassignment purposes only. Avoids
+    # snapping a re-entering player to the wrong team slot while their court
+    # projection is still noisy near the door (DOOR_Y_MIN..DOOR_Y_MAX).
+    net_deadzone_m: float = 0.5
 
     # Selection frame scoring
     selection_require_in_court: bool = True
