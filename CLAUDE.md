@@ -80,6 +80,8 @@ Computer vision system for analyzing padel matches. A phone camera is placed at 
 - `tracker.warmup_metrics` dict (tid → ratio/depth/score/locked) available after tracking for inspection
 - `tracker.warmup_frames_used` stores the actual frame count used for the warm-up window
 - **Logical player IDs** are assigned by court quadrant (not selection order): P1=near-left, P2=near-right, P3=far-left, P4=far-right — consistent across the whole video including pre-selection frames
+- **Reassignment hierarchy** (when a logical slot is missing): direct track id → same role (team_side + play_side) → same team_side → proximity to last known court position → one-to-one fallback. Direct track id rejects detections outside the court / door zone via `_is_valid_player_position`.
+- **Net dead-zone** (`net_deadzone_m`, default 0.5 m): during *structural* reassignment only (same-role / same-team-side steps), detections inside ±0.5 m of the net line are treated as side-unknown so a re-entering player whose court projection is still noisy near the door cannot snap to the wrong team slot. Direct track-id matching, proximity fallback, side-swap detection, and state initialization keep the raw `y = COURT_LENGTH/2` cutoff.
 
 ### Video I/O (`padeldet/video.py`)
 - `VideoInfo` dataclass + `frame_generator()` using OpenCV
