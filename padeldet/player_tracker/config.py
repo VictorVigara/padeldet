@@ -16,7 +16,7 @@ class PlayerTrackerConfig:
     # number of players to track) via `padeldet.match_profile.MATCH_PROFILES`.
     match_type: MatchType = "doubles" # [doubles, singles]
 
-    model_path: Literal["yolov8m.pt", "yolo26m.pt"] = "yolo26m.pt"
+    model_path: Literal["yolov8n.pt", "yolov8m.pt", "yolo26m.pt"] = "yolov8n.pt"
     confidence: float = 0.1
     iou_threshold: float = 0.1
     imgsz: int = 960
