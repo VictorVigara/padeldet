@@ -133,24 +133,38 @@ def _smooth_positions(
 def assign_teams(
     tracks: dict[int, PlayerTrack],
     n_init_frames: int = 30,
+    net_y: float | None = None,
 ) -> TeamAssignment:
     """Assign players to near/far teams based on initial court position.
 
-    Sorts players by median Y over the first `n_init_frames`, then splits
-    them in half: the lower-Y half is the near team, the higher-Y half is
-    the far team. Works for doubles (2 + 2) and singles (1 + 1).
+    For doubles (4 players) sorts by median Y and splits half/half.
+    For singles (2 players) the lower-Y player is near, the higher-Y far.
+    For a single tracked player, splits by the net line (`net_y`, defaulting
+    to the midpoint of the player's own median if unknown) so the player
+    lands on the correct side without being duplicated onto both teams.
     """
     median_y: dict[int, float] = {}
     for tid, track in tracks.items():
-        # Use first n_init_frames worth of positions
         mask = track.frames < track.frames[0] + n_init_frames
         y_init = track.y[mask] if mask.any() else track.y
         median_y[tid] = float(np.median(y_init))
 
-    # Sort by median Y, split into near (lower Y) and far (higher Y)
     sorted_ids = sorted(median_y.keys(), key=lambda t: median_y[t])
-    half = len(sorted_ids) // 2
-    near = tuple(sorted_ids[:half]) if half > 0 else tuple(sorted_ids)
-    far = tuple(sorted_ids[half:])
 
+    # 0 players → empty teams; team_for is never called in that path.
+    if not sorted_ids:
+        return TeamAssignment(near_team=(), far_team=())
+
+    # 1 player → place on its actual side using the net line if provided,
+    # otherwise default to near. Never duplicate onto both teams.
+    if len(sorted_ids) == 1:
+        tid = sorted_ids[0]
+        if net_y is not None and median_y[tid] > net_y:
+            return TeamAssignment(near_team=(), far_team=(tid,))
+        return TeamAssignment(near_team=(tid,), far_team=())
+
+    # ≥2 players → split half/half by median Y.
+    half = len(sorted_ids) // 2
+    near = tuple(sorted_ids[:half])
+    far = tuple(sorted_ids[half:])
     return TeamAssignment(near_team=near, far_team=far)
