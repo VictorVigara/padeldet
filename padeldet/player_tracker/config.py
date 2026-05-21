@@ -68,6 +68,16 @@ class PlayerTrackerConfig:
     # projection is still noisy near the door (the y-band around the net line).
     net_deadzone_m: float = 0.5
 
+    # Time-window distance gate for structural reassignment (Steps 2, 3, 5).
+    # During the first `recovery_gating_window_sec` seconds after a player is
+    # lost, a candidate detection is only accepted if its court position lies
+    # within a growing radius of the state's last_court_position. The radius
+    # interpolates linearly from `initial_radius_m` (t=0) to `final_radius_m`
+    # (t=window). After the window the gate is off (current behaviour).
+    recovery_gating_window_sec: float = 2.0
+    recovery_gating_initial_radius_m: float = 1.0
+    recovery_gating_final_radius_m: float = 3.0
+
     # Selection frame scoring
     selection_require_in_court: bool = True
     # When True and court_projection is available: use depth-based auto-selection (no UI).

@@ -96,6 +96,39 @@ def _same_team_side(
     return det_team == state.team_side
 
 
+def _within_recovery_radius(
+    state: LogicalPlayerState,
+    det: TrackedDetection,
+    frame_index: int,
+    effective_fps: float,
+    window_sec: float,
+    initial_radius_m: float,
+    final_radius_m: float,
+) -> bool:
+    """Time-window distance gate for structural reassignment.
+
+    Within the first `window_sec` seconds after a player was last seen, the
+    candidate detection must lie within a growing radius of the state's last
+    known court position (linear interpolation from `initial_radius_m` at
+    t=0 to `final_radius_m` at t=window). Outside the window, gating is off.
+
+    Falls open (returns True) when either side lacks a court position — the
+    caller's structural check is then the only constraint.
+    """
+    if state.last_court_position is None or det.court_position is None:
+        return True
+    fps = max(effective_fps, 1e-6)
+    t_sec = max(0, frame_index - state.last_seen_frame) / fps
+    if window_sec <= 0 or t_sec >= window_sec:
+        return True
+    frac = min(max(t_sec / window_sec, 0.0), 1.0)
+    radius = initial_radius_m + (final_radius_m - initial_radius_m) * frac
+    dist = float(np.linalg.norm(
+        np.asarray(det.court_position, dtype=float) - state.last_court_position
+    ))
+    return dist <= radius
+
+
 def _court_depth(
     court_position: np.ndarray,
     width_m: float,
@@ -181,7 +214,12 @@ class LogicalPlayerManager:
     singles → 2 players, team-side only (P1=near, P2=far, `play_side=None`).
     """
 
-    def __init__(self, config: PlayerTrackerConfig, profile: MatchProfile):
+    def __init__(
+        self,
+        config: PlayerTrackerConfig,
+        profile: MatchProfile,
+        effective_fps: float = 30.0,
+    ):
         self.config = config
         self.profile = profile
         self.width_m = profile.court.width_m
@@ -191,6 +229,7 @@ class LogicalPlayerManager:
         self.door_y_max = self.net_y + DOOR_HALF_WIDTH_M
         self.n_players = profile.n_players
         self.uses_play_side = self.n_players >= 4
+        self.effective_fps = effective_fps
         self.states: list[LogicalPlayerState] = []
         self.team1_side: Literal["near", "far"] = "near"
         self._side_change_allowed: bool = False
@@ -316,18 +355,32 @@ class LogicalPlayerManager:
         width_m = self.width_m
         length_m = self.length_m
 
+        # Time-window distance gate (Steps 2, 3, 5): within the first
+        # `recovery_gating_window_sec` after a state was last seen, reject
+        # candidates farther than a growing radius from the last court position.
+        gate_window = self.config.recovery_gating_window_sec
+        gate_r0 = self.config.recovery_gating_initial_radius_m
+        gate_r1 = self.config.recovery_gating_final_radius_m
+        gate_fps = self.effective_fps
+
+        def _gate(state: LogicalPlayerState, det: TrackedDetection) -> bool:
+            return _within_recovery_radius(
+                state, det, frame_index, gate_fps,
+                gate_window, gate_r0, gate_r1,
+            )
+
         # Step 2: role-based reassignment — symmetric uniqueness (same team_side + play_side)
         # Singles: states have play_side=None, so _same_role returns False — this step is a no-op.
         unassigned, missing_states = self._structural_assign(
             missing_states, unassigned, assigned_tids, result_dets, frame_index,
-            match_fn=lambda s, d: _same_role(s, d, deadzone, width_m, length_m),
+            match_fn=lambda s, d: _same_role(s, d, deadzone, width_m, length_m) and _gate(s, d),
             reason="same_role",
         )
 
         # Step 3: team-side reassignment — symmetric uniqueness (same team_side only)
         unassigned, missing_states = self._structural_assign(
             missing_states, unassigned, assigned_tids, result_dets, frame_index,
-            match_fn=lambda s, d: _same_team_side(s, d, deadzone, length_m),
+            match_fn=lambda s, d: _same_team_side(s, d, deadzone, length_m) and _gate(s, d),
             reason="same_team_side",
         )
 
@@ -345,6 +398,11 @@ class LogicalPlayerManager:
                 logging.debug(
                     f"[frame {frame_index}] one_to_one_fallback rejected (invalid position "
                     f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                )
+            elif not _gate(state, det):
+                logging.debug(
+                    f"[frame {frame_index}] one_to_one_fallback rejected (recovery_gate): "
+                    f"logical_id={state.logical_id} tid={det.track_id}"
                 )
             else:
                 self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
