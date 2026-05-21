@@ -358,6 +358,25 @@ class LogicalPlayerManager:
             1: self.team1_side,
             2: "far" if self.team1_side == "near" else "near",
         }
+        # Per-frame state snapshot for debug overlay / log inspection.
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            assigned_lids = {d.logical_player_id for d in result_dets}
+            slot_parts = []
+            for s in self.states:
+                marker = "·" if s.logical_id in assigned_lids else "✗"
+                role = (
+                    f"{s.team_side or '?'}/{s.play_side}"
+                    if s.play_side is not None
+                    else f"{s.team_side or '?'}"
+                )
+                slot_parts.append(
+                    f"{marker}P{s.logical_id}=tid{s.current_track_id}({role})"
+                )
+            gate = "open" if self._side_change_allowed else "closed"
+            logging.debug(
+                f"[frame {frame_index}] state: "
+                f"{' '.join(slot_parts)} gate={gate}"
+            )
         return fd_out
 
     def _team_id_sets(self) -> tuple[set[int], set[int]]:

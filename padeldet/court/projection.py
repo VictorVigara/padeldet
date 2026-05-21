@@ -284,10 +284,15 @@ def draw_mini_court(
                 fallback_color_idx += 1
             color = fallback_color_map[tid]
 
+        if det.logical_player_id is not None:
+            base = f"P{det.logical_player_id}"
+        elif det.track_id is not None:
+            base = f"#{det.track_id}"
+        else:
+            base = None
         label = (
-            f"P{det.logical_player_id}"
-            if det.logical_player_id is not None
-            else str(det.track_id) if det.track_id is not None
+            f"{base} ({court_x:.1f}, {court_y:.1f})"
+            if base is not None
             else None
         )
 

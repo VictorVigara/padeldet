@@ -134,6 +134,8 @@ def run_eval(
     tracker: str = "bytetrack",
     video_bytes: bytes | None = None,
     annotate_video: bool = True,
+    debug_overlay: bool = False,
+    match_type: str = "doubles",
 ) -> dict:
     import json
     import time
@@ -144,7 +146,9 @@ def run_eval(
 
     from padeldet.court.models import CourtKeypoints
     from padeldet.court.projection import CourtProjection, draw_mini_court
+    from padeldet.match_profile import MATCH_PROFILES
     from padeldet.models import save_detections
+    from padeldet.player_tracker import PlayerTrackerConfig
     from padeldet.video import VideoInfo, VideoWriter, frame_generator
 
     # Video either passed directly as bytes (small files) or already in the volume.
@@ -160,8 +164,17 @@ def run_eval(
     print(f"Video: {video_filename}  {video_info.width}x{video_info.height} @ {video_info.fps:.1f} fps  ({video_info.total_frames} frames)")
     print(f"Detection: stride={stride} → {effective_fps:.1f} fps")
 
-    from padeldet.match_profile import MATCH_PROFILES
-    profile = MATCH_PROFILES["doubles"]
+    # Single source of truth for match_type + court dims is PlayerTrackerConfig.
+    # Only override values that differ from the dataclass defaults.
+    player_config = PlayerTrackerConfig(
+        pose_model_path="/weights/yolo26m-pose.pt",
+        tracker_type=tracker,
+    )
+    profile = MATCH_PROFILES[player_config.match_type]
+    print(
+        f"Match type: {player_config.match_type} "
+        f"({profile.n_players} players on {profile.court.width_m:.1f}x{profile.court.length_m:.1f} m)"
+    )
 
     court_projection = None
     if keypoints_dict is not None:
@@ -178,8 +191,10 @@ def run_eval(
 
     if strategy in ("player", "all"):
         report["player"] = _run_player(
-            video_path, video_info, court_projection, stride, start, end, tracker,
+            video_path, video_info, court_projection, stride, start, end,
+            config=player_config,
             annotate_video=annotate_video,
+            debug_overlay=debug_overlay,
         )
 
     if strategy in ("ball", "all"):
@@ -193,29 +208,35 @@ def run_eval(
     return report
 
 
-def _run_player(video_path, video_info, court_projection, stride, start, end, tracker="bytetrack", annotate_video=True):
+def _run_player(
+    video_path, video_info, court_projection, stride, start, end,
+    *, config, annotate_video=True, debug_overlay=False,
+):
+    import logging
     import time
     import cv2
-    from padeldet.player_tracker import PlayerTracker, PlayerTrackerConfig
+    from padeldet.player_tracker import PlayerTracker
+    from padeldet.player_tracker.debug_overlay import FrameLogCapture, draw_log_overlay
     from padeldet.models import save_detections
     from padeldet.video import VideoWriter, frame_generator
     from padeldet.court.projection import draw_mini_court
 
     t0 = time.time()
-    config = PlayerTrackerConfig(
-        model_path="yolov8m.pt",
-        pose_model_path="/weights/yolo26m-pose.pt",
-        confidence=0.1,
-        iou_threshold=0.1,
-        imgsz=960,
-        batch_size=8,
-        tracker_type=tracker,
-        auto_select_players=True,
-        device="cuda",
-    )
     tracker_obj = PlayerTracker(config=config, video_info=video_info, court_projection=court_projection)
+
+    log_cap = None
+    if debug_overlay:
+        log_cap = FrameLogCapture(level=logging.DEBUG)
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        root.addHandler(log_cap)
+
     frames = frame_generator(video_path, start=start, end=end, stride=stride)
-    player_results = tracker_obj.run(frames, start_frame=start, stride=stride)
+    try:
+        player_results = tracker_obj.run(frames, start_frame=start, stride=stride)
+    finally:
+        if log_cap is not None:
+            logging.getLogger().removeHandler(log_cap)
     tracking_duration_s = round(time.time() - t0, 1)
 
     if annotate_video:
@@ -238,6 +259,8 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
                             cv2.circle(annotated, (ax, ay), 8, (255, 255, 255), 2)
                     if court_projection is not None:
                         annotated = draw_mini_court(annotated, court_projection, last_fd)
+                    if log_cap is not None:
+                        annotated = draw_log_overlay(annotated, log_cap.lines_for(abs_idx))
                 else:
                     annotated = frame
                 writer.write(annotated)
@@ -256,12 +279,13 @@ def _run_player(video_path, video_info, court_projection, stride, start, end, tr
         for d in fd.detections
         if d.track_id is not None
     }
+    n_players = tracker_obj.n_players
     report = {
         "frames_processed": len(player_results),
         "unique_track_ids": len(all_ids),
         "avg_detections_per_frame": round(sum(counts) / max(len(counts), 1), 2),
-        "frames_with_4_players": sum(1 for c in counts if c == 4),
-        "frames_with_lt4_players": sum(1 for c in counts if c < 4),
+        f"frames_with_{n_players}_players": sum(1 for c in counts if c == n_players),
+        f"frames_with_lt{n_players}_players": sum(1 for c in counts if c < n_players),
         "tracking_duration_s": tracking_duration_s,
         "annotation_duration_s": annotation_duration_s,
         "duration_s": tracking_duration_s + annotation_duration_s,
@@ -392,6 +416,7 @@ def main(
     end: str = "",
     tracker: str = "bytetrack",
     no_video: bool = False,
+    debug_overlay: bool = False,
 ):
     import json
     from pathlib import Path
@@ -447,6 +472,7 @@ def main(
         tracker=tracker,
         video_bytes=video_bytes,
         annotate_video=not no_video,
+        debug_overlay=debug_overlay,
     )
 
     print("\n=== Report ===")

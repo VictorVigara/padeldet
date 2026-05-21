@@ -11,6 +11,7 @@ Defaults (all saved next to the video):
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 import cv2
@@ -24,6 +25,7 @@ from padeldet.court.projection import CourtProjection, draw_mini_court
 from padeldet.match_profile import MATCH_PROFILES
 from padeldet.models import save_detections
 from padeldet.player_tracker import PlayerTracker, PlayerTrackerConfig
+from padeldet.player_tracker.debug_overlay import FrameLogCapture, draw_log_overlay
 from padeldet.video import VideoInfo, VideoWriter, frame_generator
 
 
@@ -46,6 +48,8 @@ def parse_args():
                         help="YOLO pose model for ankle midpoint extraction")
     parser.add_argument("--match-type", default="doubles", choices=["doubles", "singles"],
                         help="Match type — selects player count + court dimensions (default: doubles)")
+    parser.add_argument("--debug-overlay", action="store_true",
+                        help="Capture per-frame [frame N] log records and draw them on the output video")
     args = parser.parse_args()
 
     # Fill in defaults relative to the video folder
@@ -173,10 +177,22 @@ def main():
         stride = max(1, round(video_info.fps / args.detection_fps))
         print(f"Detection stride: {stride} (≈{video_info.fps / stride:.1f} fps)")
 
+    # Optionally capture per-frame log records for video overlay.
+    log_cap = None
+    if args.debug_overlay:
+        log_cap = FrameLogCapture(level=logging.DEBUG)
+        root = logging.getLogger()
+        root.setLevel(logging.DEBUG)
+        root.addHandler(log_cap)
+
     # Run detection + tracking
     print("\n--- Detection + Tracking ---")
     frames = frame_generator(video_path, start=args.start, end=args.end, stride=stride)
-    results = tracker.run(frames, start_frame=args.start, stride=stride)
+    try:
+        results = tracker.run(frames, start_frame=args.start, stride=stride)
+    finally:
+        if log_cap is not None:
+            logging.getLogger().removeHandler(log_cap)
 
     # Print stats
     print_stats(
@@ -202,6 +218,8 @@ def main():
                         cv2.circle(annotated, (ax, ay), 8, (255, 255, 255), 2)
                 if court_projection is not None:
                     annotated = draw_mini_court(annotated, court_projection, last_fd)
+                if log_cap is not None:
+                    annotated = draw_log_overlay(annotated, log_cap.lines_for(abs_idx))
             else:
                 annotated = frame
             writer.write(annotated)
