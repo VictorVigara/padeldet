@@ -452,7 +452,7 @@ class PlayerTracker(Tracker):
                 )
 
         # Phase 3: initialize identity manager from the selected frame
-        identity_manager = LogicalPlayerManager(self.config, self.profile)
+        identity_manager = LogicalPlayerManager(self.config, self.profile, effective_fps)
         identity_manager.initialize(selected_dets, best_fd.frame_index)
 
         sel_frame_idx = best_fd.frame_index
