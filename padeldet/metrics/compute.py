@@ -73,12 +73,12 @@ def compute_metrics(
     for tid, track in sorted(tracks.items()):
         print(f"  Player {tid}: {track.num_frames} frames")
 
-    # 2. Assign teams
-    teams = assign_teams(tracks, config.team_init_frames)
-    print(f"Teams — near: {teams.near_team}, far: {teams.far_team}")
-
     width_m = projection.width_m
     length_m = projection.length_m
+
+    # 2. Assign teams (singles-safe: handles 1- and 2-player cases via net_y)
+    teams = assign_teams(tracks, config.team_init_frames, net_y=length_m / 2)
+    print(f"Teams — near: {teams.near_team}, far: {teams.far_team}")
 
     # 3. Per-player metrics
     player_results: list[PlayerMetricsResult] = []
@@ -104,7 +104,8 @@ def compute_metrics(
             )
         )
 
-    # 4. Per-team metrics — formation timeline requires 2 players per team (doubles only)
+    # 4. Per-team metrics — formation timeline only makes sense with a pair,
+    #    so singles teams (1 player each) skip this and produce no team result.
     team_results: list[TeamMetricsResult] = []
     for team_name, player_ids in [
         ("near", teams.near_team),

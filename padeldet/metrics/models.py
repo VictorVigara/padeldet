@@ -53,10 +53,14 @@ class PlayerTrack:
 
 @dataclass
 class TeamAssignment:
-    """Which players are on which side of the court."""
+    """Which players are on which side of the court.
 
-    near_team: tuple[int, int]  # track_ids, Y < 10m
-    far_team: tuple[int, int]  # track_ids, Y > 10m
+    Sizes depend on the match profile: doubles has 2 players per team,
+    singles has 1. The tuple is variable-length so both fit.
+    """
+
+    near_team: tuple[int, ...]  # logical_player_ids on the near half (Y < length_m/2)
+    far_team: tuple[int, ...]  # logical_player_ids on the far half (Y > length_m/2)
 
     def team_for(self, track_id: int) -> str:
         """Return 'near' or 'far' for a given track_id."""
@@ -130,10 +134,14 @@ class PlayerMetricsResult:
 
 @dataclass
 class TeamMetricsResult:
-    """Metrics for a team (pair of players)."""
+    """Metrics for a team. Doubles: 2 players; singles: 1 player.
+
+    Singles teams have no formation_distribution (formations require a pair),
+    so this struct is only emitted for doubles in the singles profile path.
+    """
 
     team: str  # "near" or "far"
-    player_ids: tuple[int, int]
+    player_ids: tuple[int, ...]
     formation_distribution: dict[str, float]  # Formation.value -> fraction
 
     def serialize(self) -> dict:
