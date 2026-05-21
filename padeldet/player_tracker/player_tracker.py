@@ -11,8 +11,8 @@ from tqdm import tqdm
 from ultralytics import YOLO
 
 from ..base import Tracker
-from ..court.models import COURT_LENGTH, COURT_WIDTH
 from ..court.projection import CourtProjection
+from ..match_profile import MATCH_PROFILES
 from ..models import BoundingBox, FrameDetections, TrackedDetection
 from ..video import VideoInfo
 from .config import PlayerTrackerConfig
@@ -21,7 +21,7 @@ from .filters import (
     enrich_court_positions,
     filter_sv_detections_for_tracking,
 )
-from .identity import LogicalPlayerManager, _court_depth, _position_sort_key
+from .identity import LogicalPlayerManager, _court_depth
 from .selector import PlayerSelectorUI
 
 
@@ -44,6 +44,8 @@ class PlayerTracker(Tracker):
     ):
         super().__init__(video_info=video_info)
         self.config = config or PlayerTrackerConfig()
+        self.profile = MATCH_PROFILES[self.config.match_type]
+        self.n_players = self.profile.n_players
         self.court_projection = court_projection
         self.model = YOLO(self.config.model_path)
         self.pose_model = YOLO(self.config.pose_model_path) if self.config.pose_model_path else None
@@ -264,30 +266,35 @@ class PlayerTracker(Tracker):
 
                     # For selection, use strict court bounds, not the tracking margin.
                     x, y = float(court_pt[0]), float(court_pt[1])
-                    inside_strict = 0.0 <= x <= COURT_WIDTH and 0.0 <= y <= COURT_LENGTH
+                    width_m = self.court_projection.width_m
+                    length_m = self.court_projection.length_m
+                    inside_strict = 0.0 <= x <= width_m and 0.0 <= y <= length_m
                     if not inside_strict:
                         continue
 
                 valid_dets.append(d)
 
             inside_count = len({d.track_id for d in valid_dets})
+            n_players = self.n_players
 
             # Main goal: maximize number of in-court detections.
             score = inside_count * 20.0
 
-            # Strongly avoid frames with fewer than 4 visible in-court tracks.
-            score -= max(0, 4 - inside_count) * 50.0
+            # Strongly avoid frames with fewer than n_players visible in-court tracks.
+            score -= max(0, n_players - inside_count) * 50.0
 
-            # Mildly penalize many extra detections, but still allow 5 if all players are visible.
-            score -= max(0, inside_count - 5) * 5.0
+            # Mildly penalize many extra detections, but still allow one extra above n_players.
+            score -= max(0, inside_count - (n_players + 1)) * 5.0
 
             if valid_dets:
                 avg_conf = sum(d.confidence for d in valid_dets) / len(valid_dets)
                 score += avg_conf * 2.0
 
                 # Tie-breaker: prefer frames where detections are deeper inside the court.
+                width_m = self.court_projection.width_m if self.court_projection else 0.0
+                length_m = self.court_projection.length_m if self.court_projection else 0.0
                 avg_depth = sum(
-                    _court_depth(np.array(d.court_position))
+                    _court_depth(np.array(d.court_position), width_m, length_m)
                     for d in valid_dets
                     if d.court_position is not None
                 ) / len(valid_dets)
@@ -299,38 +306,50 @@ class PlayerTracker(Tracker):
 
         return frames_bgr[best_i], results[best_i]
 
-    @staticmethod
     def _score_and_select(
+        self,
         fd: FrameDetections,
     ) -> "tuple[float, list[TrackedDetection]] | None":
         """Score a frame for auto-selection.
 
-        Returns (score, top-4-candidates) or None if fewer than 4 valid in-court
-        detections exist. Score = minimum court depth among the 4 chosen detections,
-        so maximising it ensures even the shallowest selected player is well inside.
+        Returns (score, top-n_players-candidates) or None if fewer than n_players
+        valid in-court detections exist. Score = minimum court depth among the
+        chosen candidates, so maximising it ensures even the shallowest selected
+        player is well inside.
         """
+        if self.court_projection is None:
+            return None
+        width_m = self.court_projection.width_m
+        length_m = self.court_projection.length_m
+        n_players = self.n_players
         valid = [
             d for d in fd.detections
             if d.track_id is not None
             and d.court_position is not None
-            and 0.0 <= d.court_position[0] <= COURT_WIDTH
-            and 0.0 <= d.court_position[1] <= COURT_LENGTH
+            and 0.0 <= d.court_position[0] <= width_m
+            and 0.0 <= d.court_position[1] <= length_m
         ]
-        if len(valid) < 4:
+        if len(valid) < n_players:
             return None
-        valid.sort(key=lambda d: _court_depth(np.array(d.court_position)), reverse=True)
-        candidates = valid[:4]
-        score = min(_court_depth(np.array(d.court_position)) for d in candidates)
+        valid.sort(
+            key=lambda d: _court_depth(np.array(d.court_position), width_m, length_m),
+            reverse=True,
+        )
+        candidates = valid[:n_players]
+        score = min(
+            _court_depth(np.array(d.court_position), width_m, length_m)
+            for d in candidates
+        )
         return score, candidates
 
     def _auto_select_players(
         self, results: list[FrameDetections]
     ) -> "tuple[list[TrackedDetection], FrameDetections]":
-        """Pick 4 player detections from the selection-window frames using court depth.
+        """Pick `n_players` detections from the selection-window frames using court depth.
 
         Scans all frames, scores each via _score_and_select, and returns the candidate
         set and source frame from the frame with the highest score (best min court depth
-        among chosen 4).
+        among chosen candidates).
         """
         best_score: float = float("-inf")
         best_dets: list[TrackedDetection] = []
@@ -342,7 +361,7 @@ class PlayerTracker(Tracker):
             score, candidates = result
             if score > best_score:
                 best_score, best_dets, best_fd = score, candidates, fd
-        if len(best_dets) < 4:
+        if len(best_dets) < self.n_players:
             logging.warning(
                 f"Auto-selection found only {len(best_dets)} player(s) in selection window."
             )
@@ -382,23 +401,30 @@ class PlayerTracker(Tracker):
         init_results = self._run_frames(init_bgr, init_indices, desc="selection window")
 
         # Debug: show raw detection counts per frame in selection window
+        proj = self.court_projection
+        width_m = proj.width_m if proj is not None else 0.0
+        length_m = proj.length_m if proj is not None else 0.0
         for fd in init_results:
-            in_court = [
-                d for d in fd.detections
-                if d.court_position is not None
-                and 0.0 <= d.court_position[0] <= COURT_WIDTH
-                and 0.0 <= d.court_position[1] <= COURT_LENGTH
-            ]
+            if proj is not None:
+                in_court = [
+                    d for d in fd.detections
+                    if d.court_position is not None
+                    and 0.0 <= d.court_position[0] <= width_m
+                    and 0.0 <= d.court_position[1] <= length_m
+                ]
+            else:
+                in_court = []
             print(
                 f"  frame {fd.frame_index}: {len(fd.detections)} tracked dets, "
                 f"{len(in_court)} strictly in court"
                 + (
-                    f", depths={[round(_court_depth(np.array(d.court_position)), 2) for d in in_court]}"
+                    f", depths={[round(_court_depth(np.array(d.court_position), width_m, length_m), 2) for d in in_court]}"
                     if in_court else ""
                 )
             )
 
         # Phase 2: player selection (automatic or manual)
+        n_players = self.n_players
         if self.config.auto_select_players and self.court_projection is not None:
             selected_dets, best_fd = self._auto_select_players(init_results)
             selected_track_ids = [d.track_id for d in selected_dets if d.track_id is not None]
@@ -406,27 +432,27 @@ class PlayerTracker(Tracker):
         else:
             best_frame, best_fd = self._best_selection_frame(init_results, init_bgr)
             n_tracks = len({d.track_id for d in best_fd.detections if d.track_id is not None})
-            if n_tracks < 4:
+            if n_tracks < n_players:
                 logging.warning(
                     f"Only {n_tracks} track(s) visible in best selection frame. "
                     "You may need to increase selection_window_sec."
                 )
             print(
                 f"\nOpening player selection UI — {n_tracks} track(s) visible."
-                " Click 4 players then press ENTER."
+                f" Click {n_players} players then press ENTER."
             )
-            selected_track_ids = PlayerSelectorUI(best_frame, best_fd).select()
+            selected_track_ids = PlayerSelectorUI(best_frame, best_fd, n_players=n_players).select()
             print(f"Locked player IDs (click order = logical order): {selected_track_ids}")
             by_tid = {d.track_id: d for d in best_fd.detections if d.track_id is not None}
             selected_dets = [by_tid[tid] for tid in selected_track_ids if tid in by_tid]
-            if len(selected_dets) < 4:
+            if len(selected_dets) < n_players:
                 logging.warning(
-                    f"Only {len(selected_dets)} of 4 selected IDs found in best frame. "
+                    f"Only {len(selected_dets)} of {n_players} selected IDs found in best frame. "
                     "Proceeding with partial selection."
                 )
 
         # Phase 3: initialize identity manager from the selected frame
-        identity_manager = LogicalPlayerManager(self.config)
+        identity_manager = LogicalPlayerManager(self.config, self.profile)
         identity_manager.initialize(selected_dets, best_fd.frame_index)
 
         sel_frame_idx = best_fd.frame_index

@@ -170,10 +170,17 @@ def main():
     print(f"  Frames: {video_info.total_frames}")
 
     # Load court keypoints if provided
+    from padeldet.match_profile import MATCH_PROFILES
+    profile = MATCH_PROFILES[getattr(args, "match_type", "doubles")]
+
     court_projection = None
     if args.court_keypoints:
         keypoints = CourtKeypoints.load(args.court_keypoints)
-        court_projection = CourtProjection(keypoints)
+        court_projection = CourtProjection(
+            keypoints,
+            width_m=profile.court.width_m,
+            length_m=profile.court.length_m,
+        )
         print(f"\nCourt keypoints loaded: {keypoints.num_available}/12 points")
 
     # Load player detections if provided

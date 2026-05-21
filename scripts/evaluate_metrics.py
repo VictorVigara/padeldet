@@ -31,6 +31,10 @@ def parse_args():
     parser.add_argument(
         "--plot", action="store_true", help="Generate heatmap plots (requires matplotlib)"
     )
+    parser.add_argument(
+        "--match-type", default="doubles", choices=["doubles", "singles"],
+        help="Match type — selects court dimensions (default: doubles)",
+    )
     args = parser.parse_args()
 
     if args.data_dir:
@@ -125,9 +129,16 @@ def main():
     detections = load_detections(args.player_json)
     print(f"  {len(detections)} frames loaded")
 
+    from padeldet.match_profile import MATCH_PROFILES
+    profile = MATCH_PROFILES[args.match_type]
+
     print(f"Loading court keypoints from: {args.court_keypoints}")
     keypoints = CourtKeypoints.load(args.court_keypoints)
-    projection = CourtProjection(keypoints)
+    projection = CourtProjection(
+        keypoints,
+        width_m=profile.court.width_m,
+        length_m=profile.court.length_m,
+    )
     print(f"  {keypoints.num_available}/12 keypoints available")
 
     # Compute metrics

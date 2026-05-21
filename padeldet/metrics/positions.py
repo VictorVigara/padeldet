@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 from scipy.signal import savgol_filter
 
-from ..court.models import NET_POSITION
 from ..court.projection import CourtProjection
 from ..models import FrameDetections
 from .models import PlayerTrack, TeamAssignment
@@ -137,7 +136,9 @@ def assign_teams(
 ) -> TeamAssignment:
     """Assign players to near/far teams based on initial court position.
 
-    Players with median Y < NET_POSITION (10m) in first N frames are near team.
+    Sorts players by median Y over the first `n_init_frames`, then splits
+    them in half: the lower-Y half is the near team, the higher-Y half is
+    the far team. Works for doubles (2 + 2) and singles (1 + 1).
     """
     median_y: dict[int, float] = {}
     for tid, track in tracks.items():
@@ -148,15 +149,8 @@ def assign_teams(
 
     # Sort by median Y, split into near (lower Y) and far (higher Y)
     sorted_ids = sorted(median_y.keys(), key=lambda t: median_y[t])
-
-    if len(sorted_ids) < 4:
-        # Not enough players — best effort: split in half
-        mid = len(sorted_ids) // 2
-        near = tuple(sorted_ids[:mid]) if mid >= 2 else tuple(sorted_ids[:2])
-        far = tuple(sorted_ids[mid:]) if len(sorted_ids) - mid >= 2 else tuple(sorted_ids[2:4])
-    else:
-        # Standard case: 2 nearest to baseline = near team
-        near = (sorted_ids[0], sorted_ids[1])
-        far = (sorted_ids[2], sorted_ids[3])
+    half = len(sorted_ids) // 2
+    near = tuple(sorted_ids[:half]) if half > 0 else tuple(sorted_ids)
+    far = tuple(sorted_ids[half:])
 
     return TeamAssignment(near_team=near, far_team=far)

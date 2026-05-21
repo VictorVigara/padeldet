@@ -7,31 +7,50 @@ import numpy as np
 
 from ..models import FrameDetections, TrackedDetection
 from .models import (
-    COURT_KEYPOINTS_2D,
-    COURT_LENGTH,
-    COURT_WIDTH,
-    NET_POSITION,
+    DOOR_HALF_WIDTH_M,
     SERVICE_BOX_DEPTH,
     CourtKeypoints,
+    build_keypoints_2d,
 )
 
 
 class CourtProjection:
-    """Projects pixel coordinates to real court coordinates via homography."""
+    """Projects pixel coordinates to real court coordinates via homography.
 
-    def __init__(self, keypoints: CourtKeypoints, margin_meters: float = 0.5):
+    Court dimensions (`width_m`, `length_m`) are required and come from the
+    `MatchProfile` chosen by the caller — doubles is 10 × 20 m, singles is
+    6 × 20 m. Derived quantities (`net_y`, `door_y_min`, `door_y_max`) are
+    exposed as instance attributes so downstream consumers (identity manager,
+    filters, metrics) can read dimensions off the projection rather than
+    importing module-level constants.
+    """
+
+    def __init__(
+        self,
+        keypoints: CourtKeypoints,
+        *,
+        width_m: float,
+        length_m: float,
+        margin_meters: float = 0.5,
+    ):
         if keypoints.num_available < 4:
             raise ValueError(
                 f"Need at least 4 keypoints for homography, got {keypoints.num_available}"
             )
         self.keypoints = keypoints
+        self.width_m = width_m
+        self.length_m = length_m
+        self.net_y = length_m / 2
+        self.door_y_min = self.net_y - DOOR_HALF_WIDTH_M
+        self.door_y_max = self.net_y + DOOR_HALF_WIDTH_M
         self.margin = margin_meters
+        self._reference_2d = build_keypoints_2d(width_m, length_m)
         self._H = self._compute_homography()
         self._court_polygon_px = self._compute_court_polygon()
 
     def _compute_homography(self) -> np.ndarray:
         """Compute homography from pixel keypoints to 2D court meters."""
-        pixel_pts, court_pts = self.keypoints.get_available_pairs()
+        pixel_pts, court_pts = self.keypoints.pair_with_2d(self._reference_2d)
         src = np.array(pixel_pts, dtype=np.float64)
         dst = np.array(court_pts, dtype=np.float64)
         H, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
@@ -50,7 +69,7 @@ class CourtProjection:
             else:
                 # If a corner is missing, project back from court coords
                 court_pt = np.array(
-                    [COURT_KEYPOINTS_2D[i][0], COURT_KEYPOINTS_2D[i][1], 1.0]
+                    [self._reference_2d[i][0], self._reference_2d[i][1], 1.0]
                 )
                 H_inv = np.linalg.inv(self._H)
                 px = H_inv @ court_pt
@@ -59,15 +78,28 @@ class CourtProjection:
         return np.array(corners, dtype=np.float32)
 
     @classmethod
-    def from_matrix(cls, H: np.ndarray, margin_meters: float = 0.5) -> "CourtProjection":
+    def from_matrix(
+        cls,
+        H: np.ndarray,
+        *,
+        width_m: float,
+        length_m: float,
+        margin_meters: float = 0.5,
+    ) -> "CourtProjection":
         """Construct from a pre-computed 3×3 homography matrix (skips keypoint check)."""
         obj = object.__new__(cls)
         obj.keypoints = None
+        obj.width_m = width_m
+        obj.length_m = length_m
+        obj.net_y = length_m / 2
+        obj.door_y_min = obj.net_y - DOOR_HALF_WIDTH_M
+        obj.door_y_max = obj.net_y + DOOR_HALF_WIDTH_M
         obj.margin = margin_meters
+        obj._reference_2d = build_keypoints_2d(width_m, length_m)
         obj._H = np.array(H, dtype=np.float64)
         # Back-project the 4 court corners from court-meter space to pixel space
         H_inv = np.linalg.inv(obj._H)
-        corners_m = [(0.0, 0.0), (COURT_WIDTH, 0.0), (COURT_WIDTH, COURT_LENGTH), (0.0, COURT_LENGTH)]
+        corners_m = [(0.0, 0.0), (width_m, 0.0), (width_m, length_m), (0.0, length_m)]
         px_corners = []
         for cx, cy in corners_m:
             pt = H_inv @ np.array([cx, cy, 1.0])
@@ -114,8 +146,8 @@ class CourtProjection:
         """Check if a court-meter point is inside the court (with margin)."""
         x, y = court_xy
         return (
-            -self.margin <= x <= COURT_WIDTH + self.margin
-            and -self.margin <= y <= COURT_LENGTH + self.margin
+            -self.margin <= x <= self.width_m + self.margin
+            and -self.margin <= y <= self.length_m + self.margin
         )
 
     def court_polygon_pixels(self) -> np.ndarray:
@@ -153,9 +185,13 @@ def draw_mini_court(
         width_frac: mini-court width as fraction of frame width
         padding: pixel padding from frame edge
     """
+    width_m = projection.width_m
+    length_m = projection.length_m
+    net_y = projection.net_y
+
     fh, fw = frame.shape[:2]
     court_w = int(fw * width_frac)
-    court_h = int(court_w * (COURT_LENGTH / COURT_WIDTH))  # maintain 1:2 aspect
+    court_h = int(court_w * (length_m / width_m))  # maintain real aspect
 
     # Position: bottom-right corner
     x_offset = fw - court_w - padding
@@ -175,8 +211,8 @@ def draw_mini_court(
     def court_to_mini(cx: float, cy: float) -> tuple[int, int]:
         """Convert court meters to mini-court pixel position."""
         # Flip Y so near baseline is at bottom of mini-court
-        mx = x_offset + int(cx / COURT_WIDTH * court_w)
-        my = y_offset + court_h - int(cy / COURT_LENGTH * court_h)
+        mx = x_offset + int(cx / width_m * court_w)
+        my = y_offset + court_h - int(cy / length_m * court_h)
         return (mx, my)
 
     # Draw court lines (white)
@@ -186,9 +222,9 @@ def draw_mini_court(
     # Outer boundary
     corners = [
         court_to_mini(0, 0),
-        court_to_mini(COURT_WIDTH, 0),
-        court_to_mini(COURT_WIDTH, COURT_LENGTH),
-        court_to_mini(0, COURT_LENGTH),
+        court_to_mini(width_m, 0),
+        court_to_mini(width_m, length_m),
+        court_to_mini(0, length_m),
     ]
     for i in range(4):
         cv2.line(frame, corners[i], corners[(i + 1) % 4], line_color, line_thickness)
@@ -196,8 +232,8 @@ def draw_mini_court(
     # Net
     cv2.line(
         frame,
-        court_to_mini(0, NET_POSITION),
-        court_to_mini(COURT_WIDTH, NET_POSITION),
+        court_to_mini(0, net_y),
+        court_to_mini(width_m, net_y),
         (0, 200, 255),
         2,
     )
@@ -206,14 +242,14 @@ def draw_mini_court(
     cv2.line(
         frame,
         court_to_mini(0, SERVICE_BOX_DEPTH),
-        court_to_mini(COURT_WIDTH, SERVICE_BOX_DEPTH),
+        court_to_mini(width_m, SERVICE_BOX_DEPTH),
         line_color,
         line_thickness,
     )
     cv2.line(
         frame,
-        court_to_mini(0, COURT_LENGTH - SERVICE_BOX_DEPTH),
-        court_to_mini(COURT_WIDTH, COURT_LENGTH - SERVICE_BOX_DEPTH),
+        court_to_mini(0, length_m - SERVICE_BOX_DEPTH),
+        court_to_mini(width_m, length_m - SERVICE_BOX_DEPTH),
         line_color,
         line_thickness,
     )
@@ -221,8 +257,8 @@ def draw_mini_court(
     # Center service lines
     cv2.line(
         frame,
-        court_to_mini(COURT_WIDTH / 2, SERVICE_BOX_DEPTH),
-        court_to_mini(COURT_WIDTH / 2, COURT_LENGTH - SERVICE_BOX_DEPTH),
+        court_to_mini(width_m / 2, SERVICE_BOX_DEPTH),
+        court_to_mini(width_m / 2, length_m - SERVICE_BOX_DEPTH),
         line_color,
         line_thickness,
     )
@@ -248,17 +284,22 @@ def draw_mini_court(
                 fallback_color_idx += 1
             color = fallback_color_map[tid]
 
+        if det.logical_player_id is not None:
+            base = f"P{det.logical_player_id}"
+        elif det.track_id is not None:
+            base = f"#{det.track_id}"
+        else:
+            base = None
         label = (
-            f"P{det.logical_player_id}"
-            if det.logical_player_id is not None
-            else str(det.track_id) if det.track_id is not None
+            f"{base} ({court_x:.1f}, {court_y:.1f})"
+            if base is not None
             else None
         )
 
         if not det.is_on_court:
             # Clamp to court boundary so marker lands on the door edge in the mini-court.
-            cx = max(0.0, min(COURT_WIDTH, court_x))
-            cy = max(0.0, min(COURT_LENGTH, court_y))
+            cx = max(0.0, min(width_m, court_x))
+            cy = max(0.0, min(length_m, court_y))
             mx, my = court_to_mini(cx, cy)
             dim_color = tuple(int(c * 0.5) for c in color)
             cv2.circle(frame, (mx, my), 5, dim_color, 2, cv2.LINE_AA)
