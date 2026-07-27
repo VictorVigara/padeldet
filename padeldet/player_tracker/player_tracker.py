@@ -93,8 +93,10 @@ class PlayerTracker(Tracker):
         model = RFDETRBase(**kwargs)
         # Fuses/JITs ops for predict. One-time cost at startup, big win over
         # the hundreds-to-thousands of predict() calls in a tracking run.
+        # Must match config.batch_size — the compiled graph is batch-size-specific
+        # and predict() raises if a differently-sized batch is passed later.
         try:
-            model.optimize_for_inference()
+            model.optimize_for_inference(batch_size=self.config.batch_size)
         except Exception as e:
             print(f"[player_tracker] RF-DETR optimize_for_inference skipped: {e}")
         return model
@@ -216,9 +218,18 @@ class PlayerTracker(Tracker):
         # RF-DETR
         import cv2
         rgb_batch = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_bgr]
+        # optimize_for_inference() JIT-traces the model for a fixed batch size
+        # (config.batch_size). The final batch of a video is often smaller —
+        # pad with repeated frames to match, then drop the padding results.
+        n_real = len(rgb_batch)
+        pad = self.config.batch_size - n_real
+        if pad > 0:
+            rgb_batch = rgb_batch + [rgb_batch[-1]] * pad
         raw = self.model.predict(rgb_batch, threshold=self.config.rfdetr_threshold)
         if isinstance(raw, sv.Detections):
             raw = [raw]
+        if pad > 0:
+            raw = raw[:n_real]
         person_id = self._rfdetr_person_id if self._rfdetr_person_id is not None else 1
         target_id = self.config.person_class_id
         out = []
