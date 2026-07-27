@@ -16,6 +16,7 @@ class PlayerTrackerConfig:
     # number of players to track) via `padeldet.match_profile.MATCH_PROFILES`.
     match_type: MatchType = "doubles" # [doubles, singles]
 
+    # YOLO-only (ignored when detector_type == "rfdetr"); RFDETRBase() uses its own bundled checkpoint.
     model_path: Literal["yolov8n.pt", "yolov8m.pt", "yolo26m.pt"] = "yolov8n.pt"
     confidence: float = 0.1
     iou_threshold: float = 0.1
@@ -25,6 +26,12 @@ class PlayerTrackerConfig:
     max_players: int = 10
     # Seconds of video to process before pausing for manual player selection
     selection_window_sec: float = 2.0
+    # Detector backend. RF-DETR is the default (Apache-2.0, commercial-use safe);
+    # YOLO (Ultralytics, AGPL/paid-license) is kept as a fallback only.
+    detector_type: Literal["yolo", "rfdetr"] = "rfdetr"
+    # RF-DETR-only knobs (ignored when detector_type == "yolo")
+    rfdetr_threshold: float = 0.5
+    rfdetr_resolution: int | None = None  # must be % 56 == 0 if set
     # Tracker selection
     tracker_type: Literal["bytetrack", "deepocsort"] = "deepocsort"
     # DeepOCSORT-specific

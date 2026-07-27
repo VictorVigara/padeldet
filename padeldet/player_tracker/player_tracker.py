@@ -25,6 +25,27 @@ from .identity import LogicalPlayerManager, _court_depth
 from .selector import PlayerSelectorUI
 
 
+def _resolve_rfdetr_person_id() -> int:
+    """Resolve the COCO class id RF-DETR returns for 'person'.
+
+    predict() uses COCO-91 sparse ids (person == 1). Prefer the dict-keyed
+    mapping in the rfdetr package, which is the source of truth for that id
+    space — `RFDETRBase.class_names` is a 0-indexed display list that does
+    NOT match predict()'s class_id output.
+    """
+    for mod_path in ("rfdetr.assets.coco_classes", "rfdetr.util.coco_classes"):
+        try:
+            mod = __import__(mod_path, fromlist=["COCO_CLASSES"])
+            mapping = getattr(mod, "COCO_CLASSES")
+            if isinstance(mapping, dict):
+                for k, v in mapping.items():
+                    if isinstance(v, str) and v.lower() == "person":
+                        return int(k)
+        except Exception:
+            continue
+    return 1
+
+
 class PlayerTracker(Tracker):
     """
     Detects and tracks players using YOLO for detection and either
@@ -47,9 +68,36 @@ class PlayerTracker(Tracker):
         self.profile = MATCH_PROFILES[self.config.match_type]
         self.n_players = self.profile.n_players
         self.court_projection = court_projection
-        self.model = YOLO(self.config.model_path)
+        self._rfdetr_person_id: int | None = None
+        if self.config.detector_type == "yolo":
+            self.model = YOLO(self.config.model_path)
+        elif self.config.detector_type == "rfdetr":
+            self.model = self._init_rfdetr()
+            self._rfdetr_person_id = _resolve_rfdetr_person_id()
+            print(f"[player_tracker] RF-DETR person class id: {self._rfdetr_person_id}")
+        else:
+            raise ValueError(f"unknown detector_type: {self.config.detector_type!r}")
         self.pose_model = YOLO(self.config.pose_model_path) if self.config.pose_model_path else None
         self._init_tracker()
+
+    def _init_rfdetr(self):
+        from rfdetr import RFDETRBase
+        kwargs: dict = {"device": self.device}
+        if self.config.rfdetr_resolution is not None:
+            if self.config.rfdetr_resolution % 56 != 0:
+                raise ValueError(
+                    f"rfdetr_resolution must be divisible by 56 "
+                    f"(got {self.config.rfdetr_resolution})"
+                )
+            kwargs["resolution"] = self.config.rfdetr_resolution
+        model = RFDETRBase(**kwargs)
+        # Fuses/JITs ops for predict. One-time cost at startup, big win over
+        # the hundreds-to-thousands of predict() calls in a tracking run.
+        try:
+            model.optimize_for_inference()
+        except Exception as e:
+            print(f"[player_tracker] RF-DETR optimize_for_inference skipped: {e}")
+        return model
 
     @property
     def device(self) -> str:
@@ -116,18 +164,23 @@ class PlayerTracker(Tracker):
         self._init_tracker()
 
     def to(self, device: str) -> None:
-        self.model.to(device)
+        # RF-DETR's wrapper takes its device at construction time and exposes
+        # no .to(); only YOLO needs an explicit move call.
+        if self.config.detector_type == "yolo":
+            self.model.to(device)
 
     # ------------------------------------------------------------------
     # Per-frame processing
     # ------------------------------------------------------------------
 
     def _process_result(
-        self, result, frame_index: int, bgr_frame: np.ndarray, pose_result=None
+        self,
+        sv_dets: sv.Detections,
+        frame_index: int,
+        bgr_frame: np.ndarray,
+        pose_result=None,
     ) -> FrameDetections:
-        sv_dets = sv.Detections.from_ultralytics(result)
-        person_mask = sv_dets.class_id == self.config.person_class_id
-        sv_dets = sv_dets[person_mask]
+        # sv_dets arrives already person-filtered from _predict_persons.
         sv_dets = filter_sv_detections_for_tracking(
             sv_dets, bgr_frame.shape, self.config, self.court_projection
         )
@@ -139,6 +192,43 @@ class PlayerTracker(Tracker):
             enrich_ankle_midpoints(fd, pose_result, self.config)
         enrich_court_positions(fd, self.court_projection)
         return fd
+
+    def _predict_persons(self, batch_bgr: list[np.ndarray]) -> list[sv.Detections]:
+        """Run the configured detector and return one person-only sv.Detections
+        per input frame, with class_id renormalized to config.person_class_id."""
+        if self.config.detector_type == "yolo":
+            results = self.model.predict(
+                batch_bgr,
+                conf=self.config.confidence,
+                iou=self.config.iou_threshold,
+                imgsz=self.config.imgsz,
+                device=self.device,
+                classes=[self.config.person_class_id],
+                verbose=False,
+            )
+            out: list[sv.Detections] = []
+            for r in results:
+                sv_dets = sv.Detections.from_ultralytics(r)
+                mask = sv_dets.class_id == self.config.person_class_id
+                out.append(sv_dets[mask])
+            return out
+
+        # RF-DETR
+        import cv2
+        rgb_batch = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in batch_bgr]
+        raw = self.model.predict(rgb_batch, threshold=self.config.rfdetr_threshold)
+        if isinstance(raw, sv.Detections):
+            raw = [raw]
+        person_id = self._rfdetr_person_id if self._rfdetr_person_id is not None else 1
+        target_id = self.config.person_class_id
+        out = []
+        for sv_dets in raw:
+            mask = sv_dets.class_id == person_id
+            sv_dets = sv_dets[mask]
+            if len(sv_dets) > 0:
+                sv_dets.class_id = np.full(len(sv_dets), target_id, dtype=int)
+            out.append(sv_dets)
+        return out
 
     def _track_bytetrack(
         self, sv_dets: sv.Detections, frame_index: int
@@ -207,15 +297,7 @@ class PlayerTracker(Tracker):
                 return
             batch = list(pending)
             indices = list(pending_idx)
-            yolo_out = self.model.predict(
-                batch,
-                conf=self.config.confidence,
-                iou=self.config.iou_threshold,
-                imgsz=self.config.imgsz,
-                device=self.device,
-                classes=[self.config.person_class_id],
-                verbose=False,
-            )
+            det_out = self._predict_persons(batch)
             pose_out = (
                 self.pose_model.predict(
                     batch,
@@ -227,8 +309,8 @@ class PlayerTracker(Tracker):
                 if self.pose_model is not None
                 else [None] * len(batch)
             )
-            for fi, res, bgr, pose_res in zip(indices, yolo_out, batch, pose_out):
-                results.append(self._process_result(res, fi, bgr, pose_result=pose_res))
+            for fi, sv_dets, bgr, pose_res in zip(indices, det_out, batch, pose_out):
+                results.append(self._process_result(sv_dets, fi, bgr, pose_result=pose_res))
             pending.clear()
             pending_idx.clear()
 

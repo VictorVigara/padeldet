@@ -43,6 +43,12 @@ def parse_args():
     parser.add_argument("--court-keypoints", default=None, help="Court keypoints JSON (default: <video_dir>/court_keypoints.json if it exists)")
     parser.add_argument("--tracker-type", default="deepocsort", choices=["bytetrack", "deepocsort"],
                         help="Tracking algorithm (default: deepocsort)")
+    parser.add_argument("--detector", default="yolo", choices=["yolo", "rfdetr"],
+                        help="Person detector backend (default: yolo)")
+    parser.add_argument("--rfdetr-threshold", type=float, default=0.5,
+                        help="RF-DETR confidence threshold (ignored unless --detector rfdetr)")
+    parser.add_argument("--rfdetr-resolution", type=int, default=None,
+                        help="RF-DETR inference resolution; must be %% 56 == 0")
     parser.add_argument("--pose-model",
                         default="yolo26m-pose.pt",
                         help="YOLO pose model for ankle midpoint extraction")
@@ -162,6 +168,9 @@ def main():
         batch_size=args.batch_size,
         tracker_type=args.tracker_type,
         pose_model_path=args.pose_model,
+        detector_type=args.detector,
+        rfdetr_threshold=args.rfdetr_threshold,
+        rfdetr_resolution=args.rfdetr_resolution,
     )
     tracker = PlayerTracker(
         config=config,

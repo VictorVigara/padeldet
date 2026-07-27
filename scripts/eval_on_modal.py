@@ -83,10 +83,12 @@ _eval_image = (
         "numpy>=1.24.0",
         "opencv-python>=4.8.0",
         "pillow>=9.0.0",
+        "rfdetr",
     )
     .run_commands(
         # Pre-bake detection weights so cold-starts don't re-download.
         'python -c "from ultralytics import YOLO; YOLO(\'yolov8m.pt\')"',
+        'python -c "from rfdetr import RFDETRBase; RFDETRBase()"',
     )
     .add_local_file(
         str(_WEIGHTS_DIR / "osnet_x0_25_msmt17.pt"),
@@ -114,6 +116,13 @@ eval_volume = modal.Volume.from_name("padel-eval-videos", create_if_missing=True
 
 _MOUNT = "/eval_data"
 
+
+def _player_suffix(detector: str) -> str:
+    """Filename suffix for *player* outputs so non-default detectors don't
+    overwrite the YOLO baseline. yolo -> '' (back-compat), rfdetr -> '_rfdetr'.
+    Ball outputs are unaffected (TrackNet doesn't depend on the player detector)."""
+    return "" if detector == "yolo" else f"_{detector}"
+
 # ── GPU function ──────────────────────────────────────────────────────────────
 
 @app.function(
@@ -136,6 +145,9 @@ def run_eval(
     annotate_video: bool = True,
     debug_overlay: bool = False,
     match_type: str = "doubles",
+    detector: str = "yolo",
+    rfdetr_threshold: float = 0.5,
+    rfdetr_resolution: int | None = None,
 ) -> dict:
     import json
     import time
@@ -169,6 +181,9 @@ def run_eval(
     player_config = PlayerTrackerConfig(
         pose_model_path="/weights/yolo26m-pose.pt",
         tracker_type=tracker,
+        detector_type=detector,
+        rfdetr_threshold=rfdetr_threshold,
+        rfdetr_resolution=rfdetr_resolution,
     )
     profile = MATCH_PROFILES[player_config.match_type]
     print(
@@ -195,6 +210,7 @@ def run_eval(
             config=player_config,
             annotate_video=annotate_video,
             debug_overlay=debug_overlay,
+            suffix=_player_suffix(detector),
         )
 
     if strategy in ("ball", "all"):
@@ -210,7 +226,7 @@ def run_eval(
 
 def _run_player(
     video_path, video_info, court_projection, stride, start, end,
-    *, config, annotate_video=True, debug_overlay=False,
+    *, config, annotate_video=True, debug_overlay=False, suffix: str = "",
 ):
     import logging
     import time
@@ -241,7 +257,7 @@ def _run_player(
 
     if annotate_video:
         t_ann = time.time()
-        out_path = f"{_MOUNT}/player_output.mp4"
+        out_path = f"{_MOUNT}/player_output{suffix}.mp4"
         frame_lookup = {fd.frame_index: fd for fd in player_results}
         last_fd = None
         abs_idx = start
@@ -269,7 +285,7 @@ def _run_player(
     else:
         annotation_duration_s = 0
 
-    save_detections(player_results, f"{_MOUNT}/player_detections.json")
+    save_detections(player_results, f"{_MOUNT}/player_detections{suffix}.json")
 
     # Per-frame stats.
     counts = [len(fd) for fd in player_results]
@@ -295,7 +311,7 @@ def _run_player(
         try:
             from padeldet.metrics.compute import compute_metrics
             metrics = compute_metrics(player_results, court_projection, video_info.fps)
-            metrics.save(f"{_MOUNT}/metrics.json")
+            metrics.save(f"{_MOUNT}/metrics{suffix}.json")
             report["metrics_saved"] = True
         except Exception as e:
             report["metrics_error"] = str(e)
@@ -417,6 +433,9 @@ def main(
     tracker: str = "bytetrack",
     no_video: bool = False,
     debug_overlay: bool = False,
+    detector: str = "yolo",
+    rfdetr_threshold: float = 0.5,
+    rfdetr_resolution: int = 0,
 ):
     import json
     from pathlib import Path
@@ -473,19 +492,23 @@ def main(
         video_bytes=video_bytes,
         annotate_video=not no_video,
         debug_overlay=debug_overlay,
+        detector=detector,
+        rfdetr_threshold=rfdetr_threshold,
+        rfdetr_resolution=rfdetr_resolution if rfdetr_resolution > 0 else None,
     )
 
     print("\n=== Report ===")
     print(json.dumps(report, indent=2))
 
     # Download output files from volume.
+    suffix = _player_suffix(detector)
     output_files: list[str] = []
     if strategy in ("player", "all"):
         if not no_video:
-            output_files.append("player_output.mp4")
-        output_files.append("player_detections.json")
+            output_files.append(f"player_output{suffix}.mp4")
+        output_files.append(f"player_detections{suffix}.json")
         if keypoints_dict is not None:
-            output_files.append("metrics.json")
+            output_files.append(f"metrics{suffix}.json")
     if strategy in ("ball", "all"):
         if not no_video:
             output_files.append("ball_output.mp4")

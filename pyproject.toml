@@ -4,6 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
     "ultralytics>=8.0.0",
+    "rfdetr>=1.7.1",
     "supervision>=0.18.0",
     "boxmot>=10.0.0",
     "opencv-python>=4.8.0",
