@@ -37,8 +37,17 @@ class PlayerTrackerConfig:
     # DeepOCSORT-specific
     reid_weights: str = "weights/osnet_x0_25_msmt17.pt"
     fp16: bool = True
-    # How long (seconds) to keep a track alive without a detection match.
-    tracker_max_age_sec: float = 2.0
+    # How long (seconds) to keep a boxmot track alive without a detection match.
+    # This bridges SHORT/known off-court gaps (e.g. a player chasing a ball,
+    # ~10 s) so the raw tracker ID survives and re-entry is a seamless direct
+    # track-id match. It is NOT the mechanism for undefined-length exits — those
+    # are handled by LogicalPlayerManager, which never drops a logical player
+    # (P1–P4) and re-attaches a fresh tracker ID on re-entry via its recovery
+    # cascade. Kept modest on purpose: a very large value makes boxmot predict a
+    # drifting "ghost" box for the absent player that can latch onto a spectator
+    # near the glass/door. Note: boxmot bumps its appearance buffer max_obs to
+    # max_age+5, so larger values also cost memory. See CV-003 / re-entry notes.
+    tracker_max_age_sec: float = 10.0
     tracker_min_hits: int = 1
 
     # Court / detection box filtering
