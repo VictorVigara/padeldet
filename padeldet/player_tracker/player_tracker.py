@@ -560,9 +560,12 @@ class PlayerTracker(Tracker):
                     "Proceeding with partial selection."
                 )
 
-        # Phase 3: initialize identity manager from the selected frame
+        # Phase 3: initialize identity manager from the selected frame.
+        # Pass the whole selection window so play_side (own left/right) is seeded
+        # from each track's MEDIAN court position over the window, relative to the
+        # teammate — robust to a transient stack at the exact selection frame.
         identity_manager = LogicalPlayerManager(self.config, self.profile, effective_fps)
-        identity_manager.initialize(selected_dets, best_fd.frame_index)
+        identity_manager.initialize(selected_dets, best_fd.frame_index, window_results=init_results)
 
         sel_frame_idx = best_fd.frame_index
         selected_tid_set = set(selected_track_ids)

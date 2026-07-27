@@ -157,32 +157,38 @@ def _is_valid_player_position(
     return in_court or door_exit
 
 
-def _position_sort_key(
-    det: TrackedDetection,
-    width_m: float,
-    length_m: float,
-    n_players: int,
-) -> tuple[int, ...]:
-    """Sort key mapping a detection to a logical-id slot.
+def _median_positions(
+    window_results: list[FrameDetections],
+    track_ids: set[int],
+) -> dict[int, np.ndarray]:
+    """Median court position (x, y) per track id over the selection window.
 
-    Doubles (n_players == 4): (team_bucket, side_bucket) with player-relative
-        L/R, yielding IDs 1=near-own-left, 2=near-own-right, 3=far-own-left,
-        4=far-own-right when detections are sorted and enumerated.
-    Singles (n_players == 2): (team_bucket,) only — IDs 1=near, 2=far.
+    Only in-window detections that carry a court position count. Returns a
+    {track_id: array([median_x, median_y])} map; track ids never seen with a
+    court position are omitted. The median makes the seed robust to a transient
+    stack/cross at the exact selection frame.
     """
-    if det.court_position is None:
-        return (1, 1) if n_players >= 4 else (1,)
-    x, y = det.court_position
-    if n_players <= 2:
-        team_bucket = 0 if y < length_m / 2 else 1
-        return (team_bucket,)
-    if y < length_m / 2:
-        team_bucket = 0
-        side_bucket = 0 if x < width_m / 2 else 1
-    else:
-        team_bucket = 1
-        side_bucket = 0 if x >= width_m / 2 else 1
-    return (team_bucket, side_bucket)
+    xs: dict[int, list[float]] = {tid: [] for tid in track_ids}
+    ys: dict[int, list[float]] = {tid: [] for tid in track_ids}
+    for fd in window_results:
+        for d in fd.detections:
+            if d.track_id in track_ids and d.court_position is not None:
+                xs[d.track_id].append(float(d.court_position[0]))
+                ys[d.track_id].append(float(d.court_position[1]))
+    out: dict[int, np.ndarray] = {}
+    for tid in track_ids:
+        if xs[tid]:
+            out[tid] = np.array([float(np.median(xs[tid])), float(np.median(ys[tid]))])
+    return out
+
+
+def _own_left_camera_x_smaller(team_side: Literal["near", "far"]) -> bool:
+    """Whether a player's own-left corresponds to the smaller camera-x.
+
+    Near players face the camera → own-left = camera-left = smaller x.
+    Far players face away → own-left = camera-right = larger x.
+    """
+    return team_side == "near"
 
 
 # ---------------------------------------------------------------------------
@@ -250,48 +256,134 @@ class LogicalPlayerManager:
         self,
         selected_detections: list[TrackedDetection],
         frame_index: int,
+        window_results: list[FrameDetections] | None = None,
     ) -> None:
         """Create logical players 1..n_players from selected detections.
 
-        IDs are assigned by court structure regardless of input order. For
-        doubles (n=4) the layout is 1=near-own-left, 2=near-own-right,
-        3=far-own-left, 4=far-own-right. For singles (n=2) the layout is
-        1=near, 2=far and `play_side` stays `None`.
+        Layout: doubles → 1=near-own-left, 2=near-own-right, 3=far-own-left,
+        4=far-own-right; singles → 1=near, 2=far (`play_side` stays `None`).
+
+        Team side comes from court-y; within a team the own-left/right is
+        seeded **relative to the teammate** (not an absolute court-center
+        threshold), so two players who are momentarily on the same half at the
+        selection instant still get distinct sides. When `window_results` is
+        given, each track's representative position is its **median** over the
+        selection window (robust to a transient stack/cross); otherwise the
+        per-detection position is used. The seeded L/R is an identity: it is
+        frozen here and rides with the tracked player through in-game movement
+        (a player briefly crossing sides is NOT relabelled).
         """
-        selected_detections = sorted(
-            selected_detections,
-            key=lambda d: _position_sort_key(d, self.width_m, self.length_m, self.n_players),
-        )
+        # Representative position per selected track: median over the window if
+        # available, else the single selection-frame court position.
+        track_ids = {d.track_id for d in selected_detections if d.track_id is not None}
+        rep_pos: dict[int, np.ndarray] = {}
+        if window_results is not None:
+            rep_pos = _median_positions(window_results, track_ids)
+        for d in selected_detections:
+            if d.track_id is not None and d.track_id not in rep_pos and d.court_position is not None:
+                rep_pos[d.track_id] = np.array(d.court_position, dtype=float)
+
+        by_tid = {d.track_id: d for d in selected_detections if d.track_id is not None}
         self.states = []
-        for i, det in enumerate(selected_detections):
+
+        if self.uses_play_side:
+            self._init_doubles(by_tid, rep_pos, frame_index)
+        else:
+            self._init_singles(by_tid, rep_pos, frame_index)
+
+        mapping = ", ".join(
+            f"{s.logical_id}→tid={s.current_track_id} ({self._role_label(s)})"
+            for s in self.states
+        )
+        logging.info(f"Logical player mapping: [{mapping}]")
+
+    def _init_doubles(
+        self,
+        by_tid: dict[int, TrackedDetection],
+        rep_pos: dict[int, np.ndarray],
+        frame_index: int,
+    ) -> None:
+        """Seed P1..P4 = near-left, near-right, far-left, far-right.
+
+        Team by median-y; within each team, own-left/right by ranking the two
+        teammates' own-frame camera-x against each other. A team with only one
+        present player gets that player plus an empty (unassigned) slot for the
+        missing teammate on the opposite side.
+        """
+        net_y = self.length_m / 2
+        near_tids = [t for t, p in rep_pos.items() if p[1] < net_y]
+        far_tids = [t for t, p in rep_pos.items() if p[1] >= net_y]
+
+        # logical_id base per (team, side): near-left=1, near-right=2, far-left=3, far-right=4
+        for team_side, tids, base in (("near", near_tids, 1), ("far", far_tids, 3)):
+            left_smaller_x = _own_left_camera_x_smaller(team_side)
+            # Resolve which tid fills the own-left vs own-right slot.
+            slot_tid: dict[int, int | None] = {0: None, 1: None}  # 0=left, 1=right
+            if len(tids) >= 2:
+                # Two teammates: rank against EACH OTHER so they get distinct
+                # sides regardless of which half they cluster on.
+                ordered = sorted(tids, key=lambda t: rep_pos[t][0], reverse=not left_smaller_x)
+                slot_tid[0], slot_tid[1] = ordered[0], ordered[1]
+            elif len(tids) == 1:
+                # One teammate present: no peer to rank against, so fall back to
+                # the absolute court-half as the best guess; the missing teammate
+                # takes the opposite (empty) slot.
+                only = tids[0]
+                own_left = _play_side(rep_pos[only], team_side, self.width_m) == "left"
+                slot_tid[0 if own_left else 1] = only
+            for side_idx in (0, 1):  # 0=left slot, 1=right slot
+                logical_id = base + side_idx
+                play_side = "left" if side_idx == 0 else "right"
+                tid = slot_tid[side_idx]
+                det = by_tid.get(tid) if tid is not None else None
+                court_pos = (
+                    np.array(det.court_position, dtype=float)
+                    if det is not None and det.court_position is not None
+                    else None
+                )
+                self.states.append(
+                    LogicalPlayerState(
+                        logical_id=logical_id,
+                        current_track_id=tid,
+                        last_bbox=det.bbox if det is not None else None,
+                        last_court_position=court_pos,
+                        team_side=team_side if tid is not None else None,
+                        play_side=play_side,  # frozen identity; kept even if slot empty at init
+                        last_seen_frame=frame_index,
+                    )
+                )
+        self.states.sort(key=lambda s: s.logical_id)
+
+    def _init_singles(
+        self,
+        by_tid: dict[int, TrackedDetection],
+        rep_pos: dict[int, np.ndarray],
+        frame_index: int,
+    ) -> None:
+        """Seed P1=near, P2=far (no play_side)."""
+        net_y = self.length_m / 2
+        near_tids = [t for t, p in rep_pos.items() if p[1] < net_y]
+        far_tids = [t for t, p in rep_pos.items() if p[1] >= net_y]
+        for team_side, tids, logical_id in (("near", near_tids, 1), ("far", far_tids, 2)):
+            tid = tids[0] if tids else None
+            det = by_tid.get(tid) if tid is not None else None
             court_pos = (
                 np.array(det.court_position, dtype=float)
-                if det.court_position is not None
-                else None
-            )
-            team_side = _team_side(court_pos, self.length_m)
-            play_side = (
-                _play_side(court_pos, team_side, self.width_m)
-                if self.uses_play_side
+                if det is not None and det.court_position is not None
                 else None
             )
             self.states.append(
                 LogicalPlayerState(
-                    logical_id=i + 1,
-                    current_track_id=det.track_id,
-                    last_bbox=det.bbox,
+                    logical_id=logical_id,
+                    current_track_id=tid,
+                    last_bbox=det.bbox if det is not None else None,
                     last_court_position=court_pos,
-                    team_side=team_side,
-                    play_side=play_side,
+                    team_side=team_side if tid is not None else None,
+                    play_side=None,
                     last_seen_frame=frame_index,
                 )
             )
-        mapping = ", ".join(
-            f"{s.logical_id}→tid={s.current_track_id} "
-            f"({s.team_side or '?'}/{s.play_side or '?'})"
-            for s in self.states
-        )
-        logging.info(f"Logical player mapping: [{mapping}]")
+        self.states.sort(key=lambda s: s.logical_id)
 
     def update(self, fd: FrameDetections) -> FrameDetections:
         """Assign this frame's detections to logical players; return only assigned ones."""
