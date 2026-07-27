@@ -317,18 +317,16 @@ class LogicalPlayerManager:
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
                 if det.court_position is not None and not self._is_valid_position(det.court_position):
-                    logging.debug(
-                        f"[frame {frame_index}] direct_track_id rejected (invalid position "
-                        f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                    pos = f"({det.court_position[0]:.1f},{det.court_position[1]:.1f})"
+                    logging.info(
+                        f"[frame {frame_index}] step=direct_track_id REJECTED(invalid_position {pos}) "
+                        f"{self._role_label(state)} tid={det.track_id}"
                     )
                     continue
                 assigned_tids.add(state.current_track_id)
                 matched_lids.add(state.logical_id)
+                # _assign emits the accepted 'step=direct_track_id {role} tid=...' line.
                 self._assign(state, det, frame_index, "direct_track_id", result_dets, assigned_tids)
-                logging.debug(
-                    f"[frame {frame_index}] direct_track_id: "
-                    f"logical_id={state.logical_id} tid={det.track_id}"
-                )
 
         # Collect missing states and unassigned detections; increment missing_frames for logging
         missing_states = []
@@ -395,14 +393,15 @@ class LogicalPlayerManager:
             state = missing_states[0]
             det = unassigned[0]
             if det.court_position is not None and not self._is_valid_position(det.court_position):
-                logging.debug(
-                    f"[frame {frame_index}] one_to_one_fallback rejected (invalid position "
-                    f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                pos = f"({det.court_position[0]:.1f},{det.court_position[1]:.1f})"
+                logging.info(
+                    f"[frame {frame_index}] step=one_to_one_fallback REJECTED(invalid_position {pos}) "
+                    f"{self._role_label(state)} tid={det.track_id}"
                 )
             elif not _gate(state, det):
-                logging.debug(
-                    f"[frame {frame_index}] one_to_one_fallback rejected (recovery_gate): "
-                    f"logical_id={state.logical_id} tid={det.track_id}"
+                logging.info(
+                    f"[frame {frame_index}] step=one_to_one_fallback REJECTED(recovery_gate) "
+                    f"{self._role_label(state)} tid={det.track_id}"
                 )
             else:
                 self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
