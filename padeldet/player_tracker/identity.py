@@ -317,18 +317,16 @@ class LogicalPlayerManager:
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
                 if det.court_position is not None and not self._is_valid_position(det.court_position):
-                    logging.debug(
-                        f"[frame {frame_index}] direct_track_id rejected (invalid position "
-                        f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                    pos = f"({det.court_position[0]:.1f},{det.court_position[1]:.1f})"
+                    logging.info(
+                        f"[frame {frame_index}] step=direct_track_id REJECTED(invalid_position {pos}) "
+                        f"{self._role_label(state)} tid={det.track_id}"
                     )
                     continue
                 assigned_tids.add(state.current_track_id)
                 matched_lids.add(state.logical_id)
+                # _assign emits the accepted 'step=direct_track_id {role} tid=...' line.
                 self._assign(state, det, frame_index, "direct_track_id", result_dets, assigned_tids)
-                logging.debug(
-                    f"[frame {frame_index}] direct_track_id: "
-                    f"logical_id={state.logical_id} tid={det.track_id}"
-                )
 
         # Collect missing states and unassigned detections; increment missing_frames for logging
         missing_states = []
@@ -395,14 +393,15 @@ class LogicalPlayerManager:
             state = missing_states[0]
             det = unassigned[0]
             if det.court_position is not None and not self._is_valid_position(det.court_position):
-                logging.debug(
-                    f"[frame {frame_index}] one_to_one_fallback rejected (invalid position "
-                    f"{det.court_position}): logical_id={state.logical_id} tid={det.track_id}"
+                pos = f"({det.court_position[0]:.1f},{det.court_position[1]:.1f})"
+                logging.info(
+                    f"[frame {frame_index}] step=one_to_one_fallback REJECTED(invalid_position {pos}) "
+                    f"{self._role_label(state)} tid={det.track_id}"
                 )
             elif not _gate(state, det):
-                logging.debug(
-                    f"[frame {frame_index}] one_to_one_fallback rejected (recovery_gate): "
-                    f"logical_id={state.logical_id} tid={det.track_id}"
+                logging.info(
+                    f"[frame {frame_index}] step=one_to_one_fallback REJECTED(recovery_gate) "
+                    f"{self._role_label(state)} tid={det.track_id}"
                 )
             else:
                 self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
@@ -417,25 +416,41 @@ class LogicalPlayerManager:
             2: "far" if self.team1_side == "near" else "near",
         }
         # Per-frame state snapshot for debug overlay / log inspection.
+        # Uses ASCII markers ('+' assigned this frame, 'x' missing) so it renders
+        # in the OpenCV overlay font. Each slot shows its logical role in the
+        # team/side naming the user reads by (T1-L, T1-R, T2-L, T2-R).
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             assigned_lids = {d.logical_player_id for d in result_dets}
             slot_parts = []
             for s in self.states:
-                marker = "·" if s.logical_id in assigned_lids else "✗"
-                role = (
-                    f"{s.team_side or '?'}/{s.play_side}"
-                    if s.play_side is not None
-                    else f"{s.team_side or '?'}"
-                )
+                marker = "+" if s.logical_id in assigned_lids else "x"
                 slot_parts.append(
-                    f"{marker}P{s.logical_id}=tid{s.current_track_id}({role})"
+                    f"{marker}{self._role_label(s)}=tid{s.current_track_id}"
                 )
             gate = "open" if self._side_change_allowed else "closed"
             logging.debug(
-                f"[frame {frame_index}] state: "
+                f"[frame {frame_index}] state[+seen x=missing]: "
                 f"{' '.join(slot_parts)} gate={gate}"
             )
         return fd_out
+
+    def _role_label(self, state: LogicalPlayerState) -> str:
+        """Human-readable slot name: team + own left/right.
+
+        Doubles: P1->T1-L, P2->T1-R, P3->T2-L, P4->T2-R (team 1 is the pair
+        that started near the camera). Singles: P1->T1, P2->T2. The team number
+        follows the logical id (fixed identity), while the near/far and L/R are
+        the slot's *current* team_side/play_side so a stale/flipped role is
+        visible at a glance (e.g. 'T1-L' sitting on the far side of the net).
+        """
+        if self.n_players >= 4:
+            team_no = 1 if state.logical_id <= 2 else 2
+            side = state.play_side[0].upper() if state.play_side else "?"
+            near_far = (state.team_side or "?")[0]  # n / f / ?
+            return f"P{state.logical_id}[T{team_no}-{side} {near_far}]"
+        team_no = state.logical_id
+        near_far = (state.team_side or "?")[0]
+        return f"P{state.logical_id}[T{team_no} {near_far}]"
 
     def _team_id_sets(self) -> tuple[set[int], set[int]]:
         """Split logical IDs into the two team buckets.
@@ -563,13 +578,14 @@ class LogicalPlayerManager:
 
             state = eligible_states[si]
             det = eligible_dets[di]
+            # _assign emits the step=proximity line; add just the distance detail.
+            logging.info(
+                f"[frame {frame_index}] step=proximity {self._role_label(state)} "
+                f"dist={dists[si, di]:.2f}m"
+            )
             self._assign(state, det, frame_index, "proximity", result_dets, assigned_tids)
             used_state_lids.add(state.logical_id)
             used_det_ids.add(id(det))
-            logging.info(
-                f"[frame {frame_index}] proximity: logical_id={state.logical_id} "
-                f"tid→{det.track_id} dist={dists[si, di]:.2f}m"
-            )
 
         remaining_states = [s for s in missing_states if s.logical_id not in used_state_lids]
         remaining_dets = [d for d in unassigned if d.track_id not in assigned_tids]
@@ -591,10 +607,18 @@ class LogicalPlayerManager:
         det.visible = True
         assigned_tids.add(det.track_id)
         result_dets.append(det)
-        if reason != "direct_track_id":
+        # One consistent line per assignment naming the STEP that made it and the
+        # slot's role, so the overlay shows how each id was resolved this frame.
+        # direct_track_id is the common case (ReID continuity) -> DEBUG to avoid
+        # spamming INFO; every recovery step (a real reassignment) -> INFO.
+        role = self._role_label(state)
+        if reason == "direct_track_id":
+            logging.debug(
+                f"[frame {frame_index}] step=direct_track_id {role} tid={det.track_id}"
+            )
+        else:
             logging.info(
-                f"[frame {frame_index}] {reason}: logical_id={state.logical_id} "
-                f"tid {old_tid}→{det.track_id}"
+                f"[frame {frame_index}] step={reason} {role} tid {old_tid}->{det.track_id}"
             )
 
     def _update_state_matched(
@@ -626,8 +650,8 @@ class LogicalPlayerManager:
                 # side are not on court. This would allow to change sides during the match, and also to change back to the original side if needed.
                 self._side_change_allowed = True
                 logging.info(
-                    f"[frame {frame_index}] Side-change gate OPENED: "
-                    f"logical_id={state.logical_id} exited court"
+                    f"[frame {frame_index}] side_change_gate=OPENED "
+                    f"{self._role_label(state)} exited court"
                 )
             state.is_on_court = on_court
             det.is_on_court = on_court

@@ -127,6 +127,7 @@ class PlayerTracker(Tracker):
     def _init_deep_oc_sort(self, effective_fps: float) -> None:
         from pathlib import Path
 
+        from boxmot.reid.core import ReID
         from boxmot.trackers.deepocsort.deepocsort import DeepOcSort
 
         weights = Path(self.config.reid_weights)
@@ -138,13 +139,28 @@ class PlayerTracker(Tracker):
         # device index 0 instead, which bypasses that validation.
         boxmot_device = 0 if self.device == "cuda" else self.device
         try:
-            self.deep_tracker = DeepOcSort(
-                reid_weights=weights,
+            # DeepOcSort (boxmot >= 18) takes a pre-built ReID model object via
+            # `reid_model=`, NOT a weights path. Passing `reid_weights=`/`device=`/
+            # `half=` (the old boxmot <= 10 API) silently falls into **kwargs and
+            # leaves the tracker's `self.model` = None, which then crashes on the
+            # first update() at `self.model.get_features(...)`. Build the ReID
+            # backend explicitly and hand over its `.model` (exposes
+            # get_features(boxes, img)). See CV-003 in BUGS.md.
+            reid_backend = ReID(
+                weights=weights,
                 device=boxmot_device,
                 half=half,
+            )
+            self.deep_tracker = DeepOcSort(
+                reid_model=reid_backend.model,
                 max_age=max_age,
                 min_hits=self.config.tracker_min_hits,
             )
+            if getattr(self.deep_tracker, "model", None) is None:
+                raise RuntimeError(
+                    "DeepOcSort initialized without a ReID model "
+                    "(self.model is None) — appearance embeddings would be disabled."
+                )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize DeepOcSort. "

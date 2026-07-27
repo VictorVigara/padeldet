@@ -72,7 +72,7 @@ def draw_log_overlay(
     lines: list[str],
     *,
     max_lines: int = 12,
-    max_chars: int = 100,
+    max_chars: int = 140,  # ~fits a 1920px-wide frame at font_scale 0.45
     font_scale: float = 0.45,
     color: tuple[int, int, int] = (200, 255, 200),
     background: tuple[int, int, int] = (0, 0, 0),
@@ -94,14 +94,14 @@ def draw_log_overlay(
     y = y_start
     for line in lines[:max_lines]:
         if len(line) > max_chars:
-            line = line[: max_chars - 1] + "…"
+            line = line[: max_chars - 3] + "..."
         (tw, th), _ = cv2.getTextSize(line, font, font_scale, thickness)
         cv2.rectangle(frame, (x - 2, y - th - 4), (x + tw + 4, y + 4), background, -1)
         cv2.putText(frame, line, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
         y += th + line_spacing
 
     if len(lines) > max_lines:
-        more = f"+{len(lines) - max_lines} more…"
+        more = f"+{len(lines) - max_lines} more..."
         (tw, th), _ = cv2.getTextSize(more, font, font_scale, thickness)
         cv2.rectangle(frame, (x - 2, y - th - 4), (x + tw + 4, y + 4), background, -1)
         cv2.putText(frame, more, (x, y), font, font_scale, (180, 180, 180), thickness, cv2.LINE_AA)
