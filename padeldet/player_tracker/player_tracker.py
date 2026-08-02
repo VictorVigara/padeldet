@@ -291,6 +291,11 @@ class PlayerTracker(Tracker):
             tracks = self.deep_tracker.update(dets_np, bgr_frame)
         except np.linalg.LinAlgError:
             tracks = np.empty((0, 8))
+        # Harvest the per-track OSNet appearance embeddings the tracker just
+        # computed (used by the identity manager's ReID gallery). They are NOT in
+        # the returned rows — read them off the live tracks and join by id.
+        # active_tracks[i].id equals the tid in the output row (no offset).
+        emb_by_id = self._harvest_deepocsort_embeddings()
         tracked = []
         for row in tracks:
             x1, y1, x2, y2, tid, conf, cls, _ = row
@@ -300,9 +305,27 @@ class PlayerTracker(Tracker):
                 class_id=int(cls),
                 label="player",
                 track_id=int(tid),
+                embedding=emb_by_id.get(int(tid)),
             )
             tracked.append(det)
         return FrameDetections(frame_index=frame_index, detections=tracked)
+
+    def _harvest_deepocsort_embeddings(self) -> dict[int, np.ndarray]:
+        """Map track_id -> 512-dim OSNet embedding from the live DeepOCSORT tracks.
+
+        Returns an empty dict when ReID is disabled or unavailable (e.g. the
+        embedding_off flag, or a boxmot build without per-track `.emb`), so the
+        identity manager silently falls back to geometric matching.
+        """
+        tracker = getattr(self, "deep_tracker", None)
+        if tracker is None or getattr(tracker, "embedding_off", False):
+            return {}
+        emb_by_id: dict[int, np.ndarray] = {}
+        for trk in getattr(tracker, "active_tracks", []) or []:
+            emb = getattr(trk, "emb", None)
+            if emb is not None and getattr(emb, "size", 0) > 0:
+                emb_by_id[int(trk.id)] = np.asarray(emb, dtype=np.float32)
+        return emb_by_id
 
     # ------------------------------------------------------------------
     # Helpers

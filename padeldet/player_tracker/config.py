@@ -94,6 +94,53 @@ class PlayerTrackerConfig:
     recovery_gating_initial_radius_m: float = 1.0
     recovery_gating_final_radius_m: float = 3.0
 
+    # Break detection: when zero valid in-court players are matched for this many
+    # consecutive seconds, the manager enters a "break" — it emits empty frames
+    # and FREEZES all logical-player state (no recovery, no last_seen bump) until
+    # players return. Handles changeovers / injuries / between-point gaps without
+    # letting recovery snap slots onto near-glass noise while nobody is playing.
+    break_min_empty_sec: float = 2.0
+
+    # ReID appearance gallery (DeepOCSORT/OSNet only; no-op under bytetrack).
+    # Per-logical-player EMA embedding: emb = alpha*emb + (1-alpha)*new (mirrors
+    # boxmot's update_emb). Used to re-attach identities when the court refills
+    # after a fully-empty break, since teams may have swapped ends while empty —
+    # position alone can't tell which team is which, so we match by appearance.
+    reid_gallery_alpha: float = 0.9
+    # Minimum cosine similarity to accept a post-break appearance re-attach.
+    reid_reattach_min_cosine: float = 0.3
+
+    # Appearance-primary assignment: once every logical player has a mature
+    # gallery, each frame's valid in-court detections are matched to logical ids
+    # by gallery cosine FIRST (Hungarian), ignoring position — appearance is the
+    # authority over geometry. This is what follows a player through an end-swap
+    # (teams changing court sides), which pure geometry inverts. Empirically
+    # OSNet separates the 4 players ~0.98 vs ~0.48 for position (see
+    # scripts/analyze_player_separability.py).
+    reid_primary: bool = True
+    # Min cosine to accept an appearance-primary match (stricter than re-attach —
+    # this runs every frame, so we only override geometry on a confident match).
+    reid_primary_min_cosine: float = 0.5
+    # A player must be the CLEAR best for a detection: its cosine must beat the
+    # runner-up player's by at least this margin. Prevents the confusable pair
+    # (P1/P4) from being confidently assigned to the wrong one on a close call.
+    reid_primary_margin: float = 0.05
+    # Only fold a detection into a player's gallery when its match cosine is at
+    # least this high, so a transient mislabel can't poison the appearance model.
+    reid_gallery_update_min_cosine: float = 0.6
+    # Number of clean confident samples averaged into the FROZEN anchor gallery
+    # before it stops updating. Appearance-primary matches against the anchor, so a
+    # later mislabel can't poison it and a wrong id self-corrects next frame.
+    reid_anchor_samples: int = 60
+
+    # Door zone: a detection in the door y-band OR within this many meters of any
+    # court edge is treated as "transitioning" — near the door all players pile up
+    # at the same spot, so position is meaningless. In the door zone assignment is
+    # ReID-ONLY (appearance-primary); the geometric steps (proximity, one-to-one,
+    # direct-by-position) never assign there. A door-zone detection with no
+    # confident gallery match is left unassigned rather than mislabelled.
+    door_zone_edge_margin_m: float = 1.0
+
     # Selection frame scoring
     selection_require_in_court: bool = True
     # When True and court_projection is available: use depth-based auto-selection (no UI).

@@ -206,6 +206,16 @@ class LogicalPlayerState:
     last_seen_frame: int
     missing_frames: int = 0  # for logging/debugging only, not used for assignment gating
     is_on_court: bool = True
+    # Per-logical-player EMA appearance embedding (ReID gallery). Transient, built
+    # live from confident matches; used to re-attach identities after an empty-court
+    # break. None until the player is first seen with an embedding.
+    emb_ema: np.ndarray | None = None
+    # Frozen ANCHOR embedding, seeded from the early (clean) frames and updated
+    # only very slowly. The anchor cannot be poisoned by a transient mislabel, so
+    # matching against it lets a wrong id self-correct the next frame instead of
+    # locking in. None until enough clean samples accumulate.
+    emb_anchor: np.ndarray | None = None
+    _anchor_samples: int = 0  # count folded into the anchor (freezes after a cap)
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +249,14 @@ class LogicalPlayerManager:
         self.states: list[LogicalPlayerState] = []
         self.team1_side: Literal["near", "far"] = "near"
         self._side_change_allowed: bool = False
+        # Break state: suspend recovery and freeze identities while the court is
+        # empty (changeover / injury / between points), then re-attach by ReID on
+        # return since teams may have swapped ends while empty.
+        self.in_break: bool = False
+        self._empty_streak_frames: int = 0
+        self._break_min_empty_frames: int = max(
+            1, round(self.config.break_min_empty_sec * self.effective_fps)
+        )
 
     # ------------------------------------------------------------------
     # Helper wrappers — bind court dims from the profile
@@ -251,6 +269,380 @@ class LogicalPlayerManager:
 
     def _depth(self, court_position: np.ndarray) -> float:
         return _court_depth(court_position, self.width_m, self.length_m)
+
+    def _det_team_side(self, det: TrackedDetection) -> Literal["near", "far"] | None:
+        """A detection's team side via the net dead-zone; None if unknown.
+
+        Single source of truth for which half of the net a detection is on.
+        Returns None when the detection has no court position or lies inside the
+        ±net_deadzone_m band (side ambiguous — must not be teamed).
+        """
+        if det.court_position is None:
+            return None
+        return _team_side_with_deadzone(
+            np.array(det.court_position, dtype=float),
+            self.config.net_deadzone_m,
+            self.length_m,
+        )
+
+    def _in_door_zone(self, det: TrackedDetection) -> bool:
+        """True if a detection is in the door y-band OR near any court edge.
+
+        Near the door/edges all players pile up at the same location, so position
+        is meaningless there — assignment must be ReID-only. Geometric steps
+        (proximity, one-to-one, direct-by-position) must never assign here.
+        """
+        if det.court_position is None:
+            return True  # unknown position → treat as ambiguous, ReID-only
+        x, y = float(det.court_position[0]), float(det.court_position[1])
+        m = self.config.door_zone_edge_margin_m
+        in_door_band = self.door_y_min <= y <= self.door_y_max
+        near_edge = (x < m or x > self.width_m - m or y < m or y > self.length_m - m)
+        return in_door_band or near_edge
+
+    def _team_matches(self, state: LogicalPlayerState, det: TrackedDetection) -> bool:
+        """Hard team invariant: det may fill this slot only on the slot's own side.
+
+        A detection whose team side is unknown (no position / in dead-zone) or on
+        the opposite side of the net is rejected — recovery never crosses the net.
+        """
+        ts = self._det_team_side(det)
+        return ts is not None and ts == state.team_side
+
+    # ------------------------------------------------------------------
+    # Break detection + ReID gallery helpers
+    # ------------------------------------------------------------------
+
+    def _count_valid_in_court(self, dets: list[TrackedDetection]) -> int:
+        """Number of detections at a valid in-court position (the break signal)."""
+        n = 0
+        for d in dets:
+            if d.court_position is not None and self._is_valid_position(d.court_position):
+                n += 1
+        return n
+
+    def _make_empty_frame(self, frame_index: int) -> FrameDetections:
+        """Empty FrameDetections that still carries team_sides (display-only)."""
+        fd_out = FrameDetections(frame_index=frame_index, detections=[])
+        fd_out.team_sides = {
+            1: self.team1_side,
+            2: "far" if self.team1_side == "near" else "near",
+        }
+        return fd_out
+
+    def _update_gallery(self, state: LogicalPlayerState, det: TrackedDetection) -> None:
+        """Fold a detection's embedding into the slot's EMA gallery.
+
+        Mirrors boxmot's update_emb: emb = a*emb + (1-a)*e, renormalized. No-ops
+        on a missing / zero-norm embedding (e.g. bytetrack), so ReID stays optional.
+        """
+        e = det.embedding
+        if e is None:
+            return
+        e = np.asarray(e, dtype=np.float32)
+        n = float(np.linalg.norm(e))
+        if n < 1e-6:
+            return
+        e = e / n
+        # Anchor: average the first `anchor_cap` clean samples, then FREEZE. This
+        # reference cannot be poisoned by a later mislabel, so appearance matching
+        # against it self-corrects a wrong id instead of locking it in.
+        cap = self.config.reid_anchor_samples
+        if state._anchor_samples < cap:
+            if state.emb_anchor is None:
+                state.emb_anchor = e.copy()
+            else:
+                k = state._anchor_samples
+                v = (state.emb_anchor * k + e) / (k + 1)
+                vn = float(np.linalg.norm(v))
+                state.emb_anchor = v / vn if vn > 1e-6 else state.emb_anchor
+            state._anchor_samples += 1
+        # EMA (fast, adapts to lighting/pose); used as a secondary signal.
+        if state.emb_ema is None:
+            state.emb_ema = e.copy()
+            return
+        a = self.config.reid_gallery_alpha
+        v = a * state.emb_ema + (1.0 - a) * e
+        vn = float(np.linalg.norm(v))
+        if vn > 1e-6:
+            state.emb_ema = v / vn
+
+    def _match_greedy_or_hungarian(
+        self, sim: np.ndarray, min_cosine: float
+    ) -> list[tuple[int, int]]:
+        """Assign rows→cols maximizing cosine similarity; drop pairs < min_cosine.
+
+        Uses scipy's Hungarian solver when available, else a greedy argmax.
+        `sim` is (n_rows, n_cols). Returns a list of (row, col) index pairs.
+        """
+        if sim.size == 0:
+            return []
+        pairs: list[tuple[int, int]] = []
+        try:
+            from scipy.optimize import linear_sum_assignment
+            rows, cols = linear_sum_assignment(-sim)
+            for r, c in zip(rows, cols):
+                if sim[r, c] >= min_cosine:
+                    pairs.append((int(r), int(c)))
+            return pairs
+        except Exception:
+            pass
+        # Greedy fallback: repeatedly take the global best remaining pair.
+        s = sim.copy()
+        while True:
+            r, c = np.unravel_index(int(np.argmax(s)), s.shape)
+            if s[r, c] < min_cosine or not np.isfinite(s[r, c]):
+                break
+            pairs.append((int(r), int(c)))
+            s[r, :] = -np.inf
+            s[:, c] = -np.inf
+            if not np.isfinite(s).any():
+                break
+        return pairs
+
+    def _reattach_after_break(
+        self, fd: FrameDetections, frame_index: int
+    ) -> list[TrackedDetection]:
+        """Appearance re-attach on break exit; [] while the court is still empty.
+
+        Teams may have swapped ends during an empty-court break, so returning
+        tracks are matched to logical players by cosine similarity to each slot's
+        EMA gallery — NOT by position. Matched states have their `team_side`
+        re-derived from the new court position (play_side stays frozen). Any
+        unmatched candidates / states fall through to the normal cascade the same
+        frame. Falls back to geometric team-constrained recovery (via the normal
+        cascade) when galleries or candidate embeddings are unavailable.
+        """
+        cands = [
+            d for d in fd.detections
+            if d.track_id is not None
+            and d.court_position is not None
+            and self._is_valid_position(d.court_position)
+        ]
+        if not cands:
+            return []  # court still empty → caller keeps the break frozen
+
+        states_with_emb = [s for s in self.states if s.emb_ema is not None]
+        cand_with_emb = [
+            d for d in cands
+            if d.embedding is not None and float(np.linalg.norm(d.embedding)) > 1e-6
+        ]
+
+        if states_with_emb and cand_with_emb:
+            G = np.stack([s.emb_ema for s in states_with_emb]).astype(np.float32)  # (S,512)
+            D = np.stack([
+                np.asarray(d.embedding, dtype=np.float32)
+                / float(np.linalg.norm(d.embedding))
+                for d in cand_with_emb
+            ])  # (C,512)
+            sim = G @ D.T  # (S,C) cosine (both L2-normalized)
+            pairs = self._match_greedy_or_hungarian(
+                sim, self.config.reid_reattach_min_cosine
+            )
+            result_dets: list[TrackedDetection] = []
+            assigned_tids: set[int] = set()
+            for si, ci in pairs:
+                state, det = states_with_emb[si], cand_with_emb[ci]
+                # Teams may have swapped ends: re-derive team_side from the new
+                # position (None → re-seeded inside _update_state_matched).
+                state.team_side = self._det_team_side(det)
+                logging.info(
+                    f"[frame {frame_index}] step=reid_reattach {self._role_label(state)} "
+                    f"tid->{det.track_id} cos={sim[si, ci]:.2f}"
+                )
+                self._assign(state, det, frame_index, "reid_reattach", result_dets, assigned_tids)
+            return cands  # non-empty → signals break exit; leftovers handled by cascade
+        else:
+            logging.warning(
+                f"[frame {frame_index}] break exit with no usable embeddings — "
+                f"geometric re-attach fallback (teams may be mislabelled if they swapped ends)"
+            )
+            return cands
+
+    def _appearance_primary_assign(
+        self,
+        fd: FrameDetections,
+        frame_index: int,
+        assigned_tids: set[int],
+        result_dets: list[TrackedDetection],
+        matched_lids: set[int],
+    ) -> None:
+        """Assign detections to logical ids by gallery cosine, ahead of geometry.
+
+        Runs each frame once every logical player has a mature gallery. Builds the
+        (players x detections) cosine matrix, Hungarian-matches, and accepts pairs
+        above `reid_primary_min_cosine`. Position is IGNORED for the match, so a
+        player who crossed to the other end still gets their own id (fixes the
+        end-swap inversion). For each accepted pair the state's `team_side` is
+        re-derived from the NEW position (atomic per-player), and the gallery is
+        updated only on a high-confidence match. Unmatched ids/detections fall
+        through to the direct-track-id + geometric cascade.
+        """
+        # TWO-TIER, TEAM-CONSTRAINED appearance assignment.
+        # Team membership (P1/P2 vs P3/P4) is FIXED identity — a player can only
+        # ever be confused with their TEAMMATE, never an opponent. Only the court
+        # SIDE flips on an end-swap. So:
+        #   Tier 1: assign each side's detections to a TEAM atomically, by which
+        #           team's galleries collectively fit that side best (appearance,
+        #           not position). This moves a whole team across the net as a unit.
+        #   Tier 2: within a team+side, match its two detections to its two ids.
+        # A detection is therefore never assigned to an opponent's id.
+        if not self.uses_play_side:
+            return self._appearance_primary_singles(
+                fd, frame_index, assigned_tids, result_dets, matched_lids)
+
+        if any(self._ref_gallery(s) is None for s in self.states):
+            return  # galleries not mature yet → let geometry run
+        cands = [
+            d for d in fd.detections
+            if d.track_id is not None and d.track_id not in assigned_tids
+            and d.embedding is not None and d.court_position is not None
+            and self._is_valid_position(d.court_position)
+            and float(np.linalg.norm(d.embedding)) > 1e-6
+        ]
+        if not cands:
+            return
+
+        team1_ids, team2_ids = self._team_id_sets()      # {1,2}, {3,4}
+        st = {s.logical_id: s for s in self.states}
+        # unit-normalized candidate embeddings
+        emb = {id(d): np.asarray(d.embedding, np.float32) / float(np.linalg.norm(d.embedding))
+               for d in cands}
+
+        def team_fit(det, ids) -> float:
+            """Best cosine of this detection to either gallery of a team."""
+            gs = [self._ref_gallery(st[i]) for i in ids]
+            return max(float(g @ emb[id(det)]) for g in gs if g is not None)
+
+        # Split detections by side (near/far). Dead-zone side is unknown → side=None.
+        by_side: dict[str, list] = {"near": [], "far": [], None: []}
+        for d in cands:
+            by_side[self._det_team_side(d)].append(d)
+
+        # Tier 1: decide which TEAM occupies each side by total gallery fit.
+        near_g, far_g = by_side["near"], by_side["far"]
+        def group_fit(group, ids):
+            return sum(team_fit(d, ids) for d in group) if group else 0.0
+        # option A: team1 near / team2 far ; option B: team1 far / team2 near
+        fitA = group_fit(near_g, team1_ids) + group_fit(far_g, team2_ids)
+        fitB = group_fit(far_g, team1_ids) + group_fit(near_g, team2_ids)
+        if fitA >= fitB:
+            side_team = {"near": team1_ids, "far": team2_ids}
+        else:
+            side_team = {"near": team2_ids, "far": team1_ids}
+
+        margin = self.config.reid_primary_margin
+        min_cos = self.config.reid_primary_min_cosine
+
+        # Tier 2: within each side, match that side's detections to that team's ids.
+        for side in ("near", "far"):
+            group = by_side[side]
+            ids = sorted(side_team[side])
+            if not group:
+                continue
+            # cosine matrix (team ids x dets-on-this-side)
+            gal = [self._ref_gallery(st[i]) for i in ids]
+            sim = np.array([[float(g @ emb[id(d)]) for d in group] for g in gal])  # (2, G)
+            pairs = self._match_greedy_or_hungarian(sim, min_cos)
+            for ri, ci in pairs:
+                lid = ids[ri]
+                state, det = st[lid], group[ci]
+                if state.logical_id in matched_lids or det.track_id in assigned_tids:
+                    continue
+                cos = float(sim[ri, ci])
+                # within-team clarity: must beat the TEAMMATE for this det by margin
+                col = sim[:, ci].copy(); col[ri] = -np.inf
+                if col.size and cos - float(col.max()) < margin:
+                    continue  # ambiguous between teammates → leave to geometry/direct
+                new_side = self._det_team_side(det)
+                swapped = new_side is not None and state.team_side is not None and new_side != state.team_side
+                if new_side is not None:
+                    state.team_side = new_side
+                matched_lids.add(state.logical_id)
+                self._assign(
+                    state, det, frame_index, "reid_primary", result_dets, assigned_tids,
+                    gallery_ok=cos >= self.config.reid_gallery_update_min_cosine,
+                )
+                if swapped:
+                    logging.info(
+                        f"[frame {frame_index}] step=reid_primary SIDE-FOLLOW "
+                        f"{self._role_label(state)} tid={det.track_id} cos={cos:.2f}"
+                    )
+
+    def _appearance_primary_singles(
+        self, fd, frame_index, assigned_tids, result_dets, matched_lids
+    ) -> None:
+        """Singles: 2 players, no teams/L-R. Global gallery match with margin."""
+        states = [s for s in self.states if self._ref_gallery(s) is not None]
+        if len(states) < self.n_players:
+            return
+        cands = [
+            d for d in fd.detections
+            if d.track_id is not None and d.track_id not in assigned_tids
+            and d.embedding is not None and d.court_position is not None
+            and self._is_valid_position(d.court_position)
+            and float(np.linalg.norm(d.embedding)) > 1e-6
+        ]
+        if not cands:
+            return
+        G = np.stack([self._ref_gallery(s) for s in states]).astype(np.float32)
+        D = np.stack([np.asarray(d.embedding, np.float32) / float(np.linalg.norm(d.embedding))
+                      for d in cands])
+        sim = G @ D.T
+        pairs = self._match_greedy_or_hungarian(sim, self.config.reid_primary_min_cosine)
+        margin = self.config.reid_primary_margin
+        for si, ci in pairs:
+            state, det = states[si], cands[ci]
+            if state.logical_id in matched_lids or det.track_id in assigned_tids:
+                continue
+            cos = float(sim[si, ci])
+            col = sim[:, ci].copy(); col[si] = -np.inf
+            if col.size and cos - float(col.max()) < margin:
+                continue
+            ns = self._det_team_side(det)
+            if ns is not None:
+                state.team_side = ns
+            matched_lids.add(state.logical_id)
+            self._assign(state, det, frame_index, "reid_primary", result_dets, assigned_tids,
+                         gallery_ok=cos >= self.config.reid_gallery_update_min_cosine)
+
+    def _ref_gallery(self, state: LogicalPlayerState) -> np.ndarray | None:
+        """Reference embedding for matching: the frozen anchor if built, else EMA."""
+        return state.emb_anchor if state.emb_anchor is not None else state.emb_ema
+
+    def _appearance_agrees(self, state: LogicalPlayerState, det: TrackedDetection) -> bool:
+        """Does this detection's appearance confirm it is `state` (not another player)?
+
+        Used to validate a door-zone match. True when the detection's embedding is
+        closest to `state`'s reference gallery (by `reid_primary_margin`) and above
+        `reid_primary_min_cosine`. When no galleries exist yet (cold start) or the
+        detection has no embedding (bytetrack), returns True so ReID does not block
+        a path it cannot inform.
+        """
+        ref = self._ref_gallery(state)
+        any_gallery = any(self._ref_gallery(s) is not None for s in self.states)
+        if not any_gallery:
+            return True  # no ReID in play at all (e.g. bytetrack) → don't block
+        others = [self._ref_gallery(s) for s in self.states if s.logical_id != state.logical_id]
+        others = [g for g in others if g is not None]
+        e = det.embedding
+        if ref is None or e is None:
+            # ReID IS in play but this detection can't be confirmed → don't trust
+            # it in the door zone (leave unassigned rather than risk a mislabel).
+            return False
+        e = np.asarray(e, dtype=np.float32)
+        n = float(np.linalg.norm(e))
+        if n < 1e-6:
+            return True
+        e = e / n
+        cos = float(ref @ e)
+        if cos < self.config.reid_primary_min_cosine:
+            return False
+        if others:
+            best_other = max(float(g @ e) for g in others)
+            if cos - best_other < self.config.reid_primary_margin:
+                return False  # ambiguous with another player → don't trust here
+        return True
 
     def initialize(
         self,
@@ -391,12 +783,43 @@ class LogicalPlayerManager:
             return FrameDetections(frame_index=fd.frame_index, detections=[])
 
         frame_index = fd.frame_index
-        by_tid: dict[int, TrackedDetection] = {
-            d.track_id: d for d in fd.detections if d.track_id is not None
-        }
         assigned_tids: set[int] = set()
         result_dets: list[TrackedDetection] = []
         matched_lids: set[int] = set()
+
+        # BREAK-HOLD short-circuit: while in a break, all logical state is frozen —
+        # no recovery, no last_seen bump. Try to re-attach returning players by
+        # appearance (teams may have swapped ends). If the court is still empty,
+        # emit an empty frame and stay frozen.
+        if self.in_break:
+            returning = self._reattach_after_break(fd, frame_index)
+            if not returning:
+                return self._make_empty_frame(frame_index)
+            self.in_break = False
+            self._empty_streak_frames = 0
+            logging.info(f"[frame {frame_index}] BREAK exited (players returned)")
+            # reid_reattach already assigned matched slots; seed the tracking maps
+            # and let the normal cascade below fill any remaining slots this frame.
+            for d in fd.detections:
+                if d.logical_player_id is not None and d.track_id is not None:
+                    assigned_tids.add(d.track_id)
+                    matched_lids.add(d.logical_player_id)
+                    result_dets.append(d)
+
+        # Step 0: appearance-primary assignment (authority over geometry).
+        # When every logical player has a mature gallery, match this frame's valid
+        # in-court detections to logical ids by gallery cosine, ignoring position.
+        # This is what carries identities correctly through an end-swap, which the
+        # geometric cascade inverts. Anything not confidently matched falls through
+        # to the direct-track-id / geometric steps below.
+        if self.config.reid_primary and not self.in_break:
+            self._appearance_primary_assign(
+                fd, frame_index, assigned_tids, result_dets, matched_lids
+            )
+
+        by_tid: dict[int, TrackedDetection] = {
+            d.track_id: d for d in fd.detections if d.track_id is not None
+        }
 
         # Step 1: direct track_id matching
         # ReID gives strong evidence, but we still validate court position to reject
@@ -406,12 +829,26 @@ class LogicalPlayerManager:
         # — the player stays missing and falls through to Steps 2-5.
         min_depth = self.config.min_direct_match_court_depth_m
         for state in self.states:
+            if state.logical_id in matched_lids:
+                continue  # already re-attached this frame on break exit
             if state.current_track_id is not None and state.current_track_id in by_tid:
                 det = by_tid[state.current_track_id]
+                if det.track_id in assigned_tids:
+                    continue  # this det was consumed by a break-exit re-attach
                 if det.court_position is not None and not self._is_valid_position(det.court_position):
                     pos = f"({det.court_position[0]:.1f},{det.court_position[1]:.1f})"
                     logging.info(
                         f"[frame {frame_index}] step=direct_track_id REJECTED(invalid_position {pos}) "
+                        f"{self._role_label(state)} tid={det.track_id}"
+                    )
+                    continue
+                # In the door zone a tracker id alone is not trusted (that is how a
+                # transitioning player inherits a wrong label). Require appearance to
+                # AGREE: the detection must match this player's anchor gallery, and
+                # not match another player's anchor better.
+                if self._in_door_zone(det) and not self._appearance_agrees(state, det):
+                    logging.info(
+                        f"[frame {frame_index}] step=direct_track_id REJECTED(door_zone_reid) "
                         f"{self._role_label(state)} tid={det.track_id}"
                     )
                     continue
@@ -428,13 +865,19 @@ class LogicalPlayerManager:
                 missing_states.append(state)
 
         if not missing_states:
-            self._update_team_sides(result_dets)
-            return self._make_frame_detections(fd.frame_index, result_dets)
+            return self._finalize(frame_index, result_dets)
 
+        # Door-zone detections are EXCLUDED from the geometric cascade: near the
+        # door/edges everyone piles up at the same spot, so position-based
+        # assignment (Steps 2-5) would mislabel a transitioning player (the P4->P1
+        # bug). They can only be claimed by appearance-primary (already run above);
+        # otherwise they stay unassigned this frame and re-acquire once clearly
+        # inside the court.
         unassigned = [
             d for d in fd.detections
             if d.track_id is not None
             and d.track_id not in assigned_tids
+            and not self._in_door_zone(d)
             and (
                 d.court_position is None
                 or self._depth(np.array(d.court_position, dtype=float)) >= min_depth
@@ -495,11 +938,42 @@ class LogicalPlayerManager:
                     f"[frame {frame_index}] step=one_to_one_fallback REJECTED(recovery_gate) "
                     f"{self._role_label(state)} tid={det.track_id}"
                 )
+            elif not self._team_matches(state, det):
+                # Hard team invariant — never let the last-resort fallback cross the net.
+                logging.info(
+                    f"[frame {frame_index}] step=one_to_one_fallback REJECTED(cross_team "
+                    f"det_side={self._det_team_side(det) or '?'}) {self._role_label(state)} tid={det.track_id}"
+                )
             else:
                 self._assign(state, det, frame_index, "one_to_one_fallback", result_dets, assigned_tids)
 
+        return self._finalize(frame_index, result_dets)
+
+    def _finalize(
+        self, frame_index: int, result_dets: list[TrackedDetection]
+    ) -> FrameDetections:
+        """Run the side-swap gate, update break bookkeeping, and emit.
+
+        Break entry: when zero valid in-court players are present for
+        `_break_min_empty_frames` consecutive frames, enter the break and emit an
+        empty frame. Any frame with a valid in-court player resets the streak.
+        """
         self._update_team_sides(result_dets)
-        return self._make_frame_detections(fd.frame_index, result_dets)
+
+        if self._count_valid_in_court(result_dets) == 0:
+            self._empty_streak_frames += 1
+            if self._empty_streak_frames >= self._break_min_empty_frames:
+                if not self.in_break:
+                    self.in_break = True
+                    logging.info(
+                        f"[frame {frame_index}] BREAK entered "
+                        f"(court empty {self._empty_streak_frames}f)"
+                    )
+                return self._make_empty_frame(frame_index)
+        else:
+            self._empty_streak_frames = 0
+
+        return self._make_frame_detections(frame_index, result_dets)
 
     def _make_frame_detections(self, frame_index: int, result_dets: list[TrackedDetection]) -> FrameDetections:
         fd_out = FrameDetections(frame_index=frame_index, detections=result_dets)
@@ -646,6 +1120,19 @@ class LogicalPlayerManager:
         det_pts = np.array([d.court_position for d in eligible_dets], dtype=float)  # (D, 2)
         dists = np.linalg.norm(state_pts[:, None, :] - det_pts[None, :, :], axis=2)  # (S, D)
 
+        # HARD TEAM INVARIANT: a state may only match a detection on its own team
+        # side. Cross-net pairs are set to +inf so they can never be the argmin.
+        # A detection with unknown team side (dead-zone / no position handled above)
+        # matches no state; a state with team_side=None matches no detection.
+        det_team = [self._det_team_side(d) for d in eligible_dets]
+        team_ok = np.array(
+            [[s.team_side is not None and s.team_side == det_team[di]
+              for di in range(len(eligible_dets))]
+             for s in eligible_states],
+            dtype=bool,
+        )  # (S, D)
+        dists = np.where(team_ok, dists, np.inf)
+
         used_state_lids: set[int] = set()
         used_det_ids: set[int] = set()
 
@@ -691,6 +1178,7 @@ class LogicalPlayerManager:
         reason: str,
         result_dets: list[TrackedDetection],
         assigned_tids: set[int],
+        gallery_ok: bool = True,
     ) -> None:
         old_tid = state.current_track_id
         state.current_track_id = det.track_id
@@ -699,6 +1187,13 @@ class LogicalPlayerManager:
         det.visible = True
         assigned_tids.add(det.track_id)
         result_dets.append(det)
+        # Keep the ReID gallery fresh on confident matches, but only from a valid
+        # in-court detection so near-glass/spectator crops don't leak in. When the
+        # caller flags low confidence (gallery_ok=False, e.g. a weak appearance-
+        # primary match), skip the update so a transient mislabel can't poison the
+        # model. No-ops without an embedding (bytetrack).
+        if gallery_ok and det.court_position is not None and self._is_valid_position(det.court_position):
+            self._update_gallery(state, det)
         # One consistent line per assignment naming the STEP that made it and the
         # slot's role, so the overlay shows how each id was resolved this frame.
         # direct_track_id is the common case (ReID continuity) -> DEBUG to avoid

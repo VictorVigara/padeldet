@@ -1,320 +1,452 @@
-# Player Tracking Flow — `padeldet/player_tracker/player_tracker.py`
+# Player Tracking Flow — `padeldet/player_tracker/`
 
-A full walkthrough of the player-tracking pipeline from the moment the match video
-begins streaming into the system until a final list of identity-stable
+A full walkthrough of the player-tracking pipeline, from the moment the match
+video begins streaming into the system until a final list of identity-stable
 `FrameDetections` is emitted. The entry point is
 `PlayerTracker.detect_and_track(frames, start_frame, stride)`.
 
-The tracker collaborates with three other modules to do its job:
+The module is split across five files:
 
-- `filters.py` — pre-tracker box filtering and post-tracker enrichment
-  (court projection, ankle midpoint from pose).
+- `player_tracker.py` — `PlayerTracker`: detection, tracking, selection, and the
+  five-phase pipeline.
+- `config.py` — `PlayerTrackerConfig`: every threshold in one dataclass.
+- `filters.py` — pre-tracker box filtering and post-tracker enrichment (court
+  projection, ankle midpoint from pose).
 - `identity.py` — `LogicalPlayerManager`, the state machine that maps temporary
-  tracker IDs to persistent logical player IDs **1–4** via a five-step
-  cascade.
+  tracker IDs to persistent logical player IDs.
 - `selector.py` — interactive OpenCV UI used when automatic selection is
   disabled or impossible.
+
+**Match profiles.** The number of logical players and the court dimensions come
+from `config.match_type` → `padeldet.match_profile.MATCH_PROFILES`:
+
+| Profile | Players | Court | Logical layout |
+|---|---|---|---|
+| `doubles` (default) | 4 | 10 × 20 m | P1 near-left, P2 near-right, P3 far-left, P4 far-right (own left/right) |
+| `singles` | 2 | 6 × 20 m | P1 near, P2 far (`play_side` stays `None`) |
+
+Everything below describes doubles unless singles is called out explicitly.
 
 ---
 
 ## 1. Construction & initialization
 
-`PlayerTracker.__init__` wires up four things:
+`PlayerTracker.__init__` wires up:
 
-1. A `PlayerTrackerConfig` — every threshold (confidences, IoU, box geometry
-   limits, court margin, tracker timing, identity recovery distances,
-   selection-window length, pose keypoint indices…) lives here.
-2. An optional `CourtProjection` (homography from image pixels to court meters).
-   Without it the tracker still runs but loses every court-aware feature:
-   ROI filtering, depth scoring, structural reassignment, side-flip detection.
-3. The YOLO detector (default `yolo26m.pt`, COCO person class).
-4. An optional YOLO pose model used solely to extract ankle midpoints — these
+1. A `PlayerTrackerConfig` — all thresholds (confidences, IoU, box geometry
+   limits, court margin, tracker timing, identity recovery distances, ReID
+   thresholds, selection-window length, pose keypoint indices…).
+2. A `MatchProfile` resolved from `config.match_type`, giving `n_players` and
+   the court dimensions.
+3. An optional `CourtProjection` (homography from image pixels to court meters).
+   Without it the tracker still runs but loses every court-aware feature: depth
+   scoring, auto-selection, structural reassignment, side-flip detection.
+4. The detector — **RF-DETR by default** (`detector_type="rfdetr"`, Apache-2.0,
+   commercial-use safe). YOLO is kept as a fallback (`detector_type="yolo"`,
+   AGPL/paid license).
+5. An optional YOLO pose model used solely to extract ankle midpoints — these
    give a much more accurate foot position than the bbox bottom-center.
 
-A device is auto-detected (`cuda` or `cpu`) unless `config.device` overrides it.
+Device is auto-detected (`cuda` or `cpu`) unless `config.device` overrides it.
 
-Then `_init_tracker()` constructs either:
+### RF-DETR specifics
 
-- **ByteTrack** (supervision) — pure IoU-based, no appearance model. Cheap.
-- **DeepOCSORT** (boxmot + OSNet ReID) — appearance-aware Kalman tracker.
-  `max_age` is set in *seconds* (`tracker_max_age_sec`) and converted to
-  frames using the **effective** FPS so behavior stays consistent when the
-  user runs with a stride > 1. A boxmot quirk is patched here: when
-  `CUDA_VISIBLE_DEVICES` is set to a non-numeric string (Modal does this),
-  boxmot's `select_device` rejects the string `"cuda"`, so the integer index
-  `0` is passed instead.
+- `RFDETRBase(device=…, resolution=…)`; `rfdetr_resolution` must be divisible
+  by 56 if set.
+- `optimize_for_inference(batch_size=config.batch_size)` is called once at
+  startup (fuses/JITs ops). The compiled graph is **batch-size-specific**, so
+  `_predict_persons` pads a short final batch with repeated frames and drops
+  the padded results.
+- The person class id is resolved by `_resolve_rfdetr_person_id()`, which reads
+  the dict-keyed `COCO_CLASSES` mapping from the `rfdetr` package (COCO-91
+  sparse ids, `person == 1`). `RFDETRBase.class_names` is a 0-indexed *display*
+  list and does **not** match `predict()`'s `class_id` output — do not use it.
+  Falls back to `1`. Class ids are then renormalized to
+  `config.person_class_id`.
 
-If pose is configured, a second YOLO model is loaded.
+### Tracker initialization
+
+`_init_tracker(effective_fps)` constructs either:
+
+- **ByteTrack** (supervision) — pure IoU-based, no appearance model. Cheap, but
+  produces **no embeddings**, so every ReID feature below silently no-ops.
+- **DeepOCSORT** (boxmot + OSNet ReID) — default, appearance-aware Kalman
+  tracker. Two things matter here:
+  - `tracker_max_age_sec` (default 10 s) is converted to frames using the
+    **effective** FPS so behavior is stable under stride > 1. It is
+    deliberately modest: it only bridges *short* known gaps so the raw tracker
+    id survives. Undefined-length exits are the `LogicalPlayerManager`'s job.
+    A very large `max_age` makes boxmot predict a drifting "ghost" box that can
+    latch onto a spectator near the glass.
+  - boxmot ≥ 18 takes a **pre-built ReID model object** via `reid_model=`, not
+    a weights path. Passing the old `reid_weights=`/`device=`/`half=` API
+    silently falls into `**kwargs`, leaves `tracker.model = None`, and crashes
+    on the first `update()`. So a `ReID` backend is built explicitly and its
+    `.model` handed over, then asserted non-None (see CV-003 in `BUGS.md`).
+  - A boxmot quirk is patched: when `CUDA_VISIBLE_DEVICES` is a non-numeric
+    string (Modal sets it to `"cuda"`), boxmot's `select_device` rejects the
+    string `"cuda"`, so the integer index `0` is passed instead.
 
 ---
 
 ## 2. The main entry: `detect_and_track`
-
-The pipeline is structured into **five explicit phases**.
 
 ### Phase 0 — Bookkeeping
 
 ```
 fps           = video_info.fps (or 30 fallback)
 effective_fps = fps / stride
-n_sel         = round(selection_window_sec * effective_fps), clamped to [30, len(frames)]
+n_sel         = int(selection_window_sec * effective_fps), clamped to [30, len(frames)]
 ```
 
 The tracker is re-initialized with `effective_fps` so any time-based parameter
-(track `max_age`, etc.) is calibrated against *real* seconds — important when
-analysis is sub-sampled.
+(`max_age`, break threshold, recovery gate) is calibrated against *real*
+seconds — important when analysis is sub-sampled.
 
-The frame list is split into two contiguous segments:
-
-- `init_bgr`   — the **selection window** (first `n_sel` frames).
-- `rest_bgr`   — everything afterwards.
-
-Their absolute frame indices in the source video are reconstructed from
-`start_frame` and `stride` so that downstream consumers (metrics, overlays,
-ball-tracker fusion) see the true timestamps.
+Frames are split into `init_bgr` (the selection window) and `rest_bgr`.
+Absolute source-video indices are reconstructed from `start_frame` and `stride`
+so downstream consumers (metrics, overlays, ball-tracker fusion) see true
+timestamps.
 
 ### Phase 1 — Process the selection window
 
-`_run_frames` streams `init_bgr` through YOLO (and pose, if loaded) in
-batches of `config.batch_size`. For every batch:
+`_run_frames` streams `init_bgr` through the detector (and pose, if loaded) in
+batches of `config.batch_size`. Per frame, `_process_result`:
 
-1. YOLO predicts persons only (`classes=[person_class_id]`).
-2. Pose model (if any) predicts keypoints in parallel on the same batch.
-3. For each frame the helper `_process_result` does:
-   - `supervision.Detections.from_ultralytics(result)` and filter to person.
-   - `filter_sv_detections_for_tracking` rejects boxes that:
-     - have non-finite coords
-     - are inverted (`x2 <= x1` or `y2 <= y1`)
-     - are smaller than `min_box_height_px` or `min_box_area_px`
-     - have aspect ratio outside `[min_box_aspect_ratio, max_box_aspect_ratio]`
-     - have zero overlap with the frame
-   - Run the chosen tracker:
-     - `_track_bytetrack`: `byte_track.update_with_detections(...)`, wrap as
-       `TrackedDetection`s with their assigned `track_id`.
-     - `_track_deepocsort`: stack `[xyxy, conf, cls]`, call
-       `deep_tracker.update(...)`; wraps the same way. Catches
-       `np.linalg.LinAlgError` from the Kalman filter and emits an empty
-       result rather than crashing the pipeline on a degenerate frame.
-   - `enrich_ankle_midpoints` (only if pose was run): for each detection,
-     find the pose box with highest IoU (≥ `pose_iou_threshold`), and use its
-     left/right ankle keypoints (COCO indices 15 & 16). Each ankle is rejected
-     if its (x, y) is exactly (0, 0) or its confidence is below
-     `min_keypoint_conf`. If both ankles are valid the midpoint is averaged;
-     if only one, that one is used; if none, no ankle is set.
-   - `enrich_court_positions`: project the foot (ankle midpoint if available,
-     else `bbox.bottom_center`) through the homography to court meters.
-     Stored as `det.court_position`.
+1. `filter_sv_detections_for_tracking` rejects boxes that are non-finite,
+   inverted (`x2 <= x1` / `y2 <= y1`), below `min_box_height_px` or
+   `min_box_area_px`, outside the aspect-ratio band
+   `[min_box_aspect_ratio, max_box_aspect_ratio]`, or fully off-screen.
+2. Runs the chosen tracker:
+   - `_track_bytetrack`: `byte_track.update_with_detections(...)`.
+   - `_track_deepocsort`: stacks `[xyxy, conf, cls]`, calls
+     `deep_tracker.update(...)`, catching `np.linalg.LinAlgError` from the
+     Kalman filter and emitting an empty result rather than crashing on a
+     degenerate frame. It then calls `_harvest_deepocsort_embeddings()`, which
+     reads the 512-dim OSNet embedding off each live track (`trk.emb`) and
+     joins by id — **the embeddings are not in the returned rows**. Returns
+     `{}` when ReID is off or unavailable, so the identity manager degrades to
+     geometry.
+3. `enrich_ankle_midpoints` (pose only): picks the pose box with the highest
+   IoU (≥ `pose_iou_threshold`) and uses COCO ankle keypoints 15 & 16. An ankle
+   is rejected if its (x, y) is exactly (0, 0) or its confidence is below
+   `min_keypoint_conf`. Both valid → midpoint; one valid → that one; none → no
+   ankle.
+4. `enrich_court_positions`: projects the foot (ankle midpoint if available,
+   else `bbox.bottom_center`) through the homography into `det.court_position`
+   (meters).
 
-After the loop, the selection window is summarized to stdout with per-frame
-in-court counts and court depths for debugging.
+The window is then summarized to stdout with per-frame in-court counts and
+court depths for debugging.
 
 ### Phase 2 — Player selection
 
-Two modes, decided by `config.auto_select_players` and the availability of a
-`court_projection`.
+#### 2a. Automatic selection (`_auto_select_players`) — default
 
-#### 2a. Automatic selection (`_auto_select_players`)
-
-Default. Iterates over every `FrameDetections` in the window:
-
-- `_score_and_select(fd)` keeps detections that have a tracker ID **and** a
-  court position **strictly** inside the court (no margin). If fewer than 4
-  remain, that frame is skipped. The 4 deepest detections (largest
-  `_court_depth`, i.e. distance to the nearest court edge) are chosen, and
-  the frame is scored by the **minimum** depth among those 4 — i.e. how deep
-  even the shallowest of the chosen players is.
-- The frame that maximizes this min-depth wins, and its 4 detections become
-  the seed for the identity manager.
-
-If no frame yields ≥4 in-court detections the function still returns the
-last frame's best subset, but logs a warning.
+`_score_and_select(fd)` keeps detections with a tracker id **and** a court
+position **strictly** inside the court (no margin). If fewer than `n_players`
+remain, the frame is skipped. The `n_players` deepest detections (largest
+`_court_depth` — distance to the nearest court edge) are chosen, and the frame
+is scored by the **minimum** depth among them. The frame maximizing that score
+wins and its detections seed the identity manager.
 
 The intuition: depth-based selection prefers frames where real players are
-clearly inside the court (and thus deep), not frames where a spectator
-standing right outside the side-glass is closer to a player than to any line.
+clearly inside the court, not frames where a spectator standing right outside
+the side glass is closer to a player than to any line.
 
 #### 2b. Manual selection (`_best_selection_frame` + `PlayerSelectorUI`)
 
-Used when auto-select is off, or when there is no court projection.
+Used when `auto_select_players` is off, or there is no court projection.
 
-`_best_selection_frame` finds the frame most useful for clicking:
+`_best_selection_frame` scores each frame:
 
-- Count distinct tracker IDs that pass the "in court" check (if the config
-  requires it). With no court projection, every track counts.
-- Score = `20 × inside_count − 50 × max(0, 4 − inside_count) − 5 × max(0, inside_count − 5)`
-  — a strong reward for hitting 4 visible players, a heavy penalty for
-  fewer, a mild penalty for too many extras.
-- Add `2 × average confidence` and `2 × average court depth` as tie-breakers.
+```
+score = 20 × inside_count
+      − 50 × max(0, n_players − inside_count)
+      −  5 × max(0, inside_count − (n_players + 1))
+      +  2 × avg_confidence
+      +  2 × avg_court_depth
+```
 
-`PlayerSelectorUI` then opens an OpenCV window:
+— a strong reward for hitting `n_players` visible players, a heavy penalty for
+fewer, a mild penalty for many extras (one extra is tolerated).
 
-- Draws every tracker box, dimmed if unselected, green & thick if selected.
-- Left-click selects the nearest track within 100 px; clicking a selected
-  track deselects it.
-- BACKSPACE undoes; ENTER confirms (only when exactly 4 are selected); ESC
-  raises `RuntimeError`.
-- Returns track IDs in click order, but **click order is discarded** when
-  building logical IDs — see Phase 3.
-
-If fewer than 4 visible tracks exist a warning is logged but the process
-continues with whatever the user could click.
+`PlayerSelectorUI` then opens an OpenCV window: every tracker box is drawn
+(dimmed if unselected, green & thick if selected), left-click selects the
+nearest track within 100 px (clicking a selected track deselects), BACKSPACE
+undoes, ENTER confirms only at exactly `n_players`, ESC raises `RuntimeError`.
+Click order is returned but **discarded** — logical ids come from court
+geometry in Phase 3.
 
 ### Phase 3 — Initialize the `LogicalPlayerManager`
-TODO: I would say player position should be 1 near left, 2 near right. And then 3 far left (but real left, which in the image is opposed), and 4 far right (but real right, inverted in camera because of playing in far court side)
 
-The selected `TrackedDetection`s are sorted by `_position_sort_key`, which
-buckets them as:
+`identity_manager.initialize(selected_dets, best_fd.frame_index, window_results=init_results)`.
 
-| Court quadrant | Logical ID |
+The whole selection window is passed so each track's representative position is
+its **median** court position over the window (`_median_positions`) — robust to
+a transient stack or cross at the exact selection frame. Falls back to the
+single selection-frame position for tracks with no windowed samples.
+
+**Doubles (`_init_doubles`)** — team by median y (near = `y < L/2`), then within
+each team the own-left/right is seeded **relative to the teammate**, not against
+an absolute court-center threshold. The two teammates' camera-x values are
+ranked against each other, so two players momentarily on the same half still
+get distinct sides. Slots: near-left = 1, near-right = 2, far-left = 3,
+far-right = 4.
+
+Camera perspective **is** accounted for (`_own_left_camera_x_smaller`): near
+players face the camera, so own-left = camera-left = smaller x; far players face
+away, so own-left = camera-**right** = larger x.
+
+If a team has only one player present, that player is placed by the absolute
+court-half and the missing teammate gets the opposite empty slot (`play_side`
+still set, `current_track_id=None`, `team_side=None`).
+
+**Singles (`_init_singles`)** — P1 = near, P2 = far, `play_side=None`.
+
+The seeded `play_side` is an **identity**: it is frozen at init and rides with
+the player through in-game movement. A player briefly crossing to the other
+side of their own half is *not* relabelled.
+
+Each slot becomes a `LogicalPlayerState`:
+
+| Field | Meaning |
 |---|---|
-| near-left  (y < L/2, x < W/2) | **1** |
-| near-right (y < L/2, x ≥ W/2) | **2** |
-| far-left   (y ≥ L/2, x < W/2) | **3** |
-| far-right  (y ≥ L/2, x ≥ W/2) | **4** |
+| `logical_id` | 1…n_players, fixed forever |
+| `current_track_id` | the tracker id currently bound to this slot |
+| `last_bbox`, `last_court_position` | last confirmed observation |
+| `team_side` | `near` / `far` — the slot's *current* end of the court |
+| `play_side` | `left` / `right` (own frame), frozen identity; `None` in singles |
+| `last_seen_frame`, `missing_frames` | bookkeeping; `missing_frames` is **logging only** |
+| `is_on_court` | False once the player exits through a side door |
+| `emb_ema` | fast EMA appearance embedding (adapts to lighting/pose) |
+| `emb_anchor` | **frozen** anchor embedding, averaged over the first `reid_anchor_samples` clean matches |
 
-Click order is therefore irrelevant — logical IDs are deterministic from
-court geometry. Each ID becomes a `LogicalPlayerState` carrying:
-
-- current tracker ID
-- last bbox
-- last court position (meters)
-- team side (`near`/`far`)
-- play side (`left`/`right`) # TODO: Does it take into account the camera perspective? If we are playing in the far side, the left player in the image is actually the right player on the court, and vice versa. So maybe we should flip the logic based on team_side?
-- last-seen frame
-- `is_on_court` flag # TODO: This is the only condition to allow side change. And even if the player comes back to the same court side, side change allowed is not set to False. Probably a player should have on_court. And then, allow the change if on court of one of the team players is true in a different side, and the players of the team occupying that side are not on court. This would allow to change sides during the match, and also to change back to the original side if needed.
-
-`team1_side` is initialized to `"near"` (logical 1+2 = team 1) and a
-`_side_change_allowed` gate is left **closed**. Sides flip later only after
-the gate is opened by an explicit court-exit event (see §3.5).
+`team1_side` starts as `"near"` (logical 1+2 = team 1) and `_side_change_allowed`
+starts **closed**.
 
 ### Phase 4 — Back-fill identities across the selection window
 
-The selection-winning frame index is `sel_frame_idx`. For every frame in the
-selection window:
+For frames **before** `sel_frame_idx`: detections whose tracker id is in the
+selected set are kept and stamped from the initial `tid → logical_id` map. This
+is approximate (tracker ids are assumed unchanged that early) but good enough to
+feed metrics and visualization. Everything else is dropped.
 
-- **Before `sel_frame_idx`**: identity manager has no prior state — instead,
-  the code keeps detections whose tracker ID is in the originally selected
-  set, and copies the logical ID directly from the initial mapping. This is
-  approximate (the tracker IDs were assumed not to have changed yet) but
-  good enough for the first few seconds of the video to feed metrics &
-  visualization. Other detections are dropped.
-- **At or after `sel_frame_idx`**: routed through `identity_manager.update()`
-  using the same logic as the live phase below.
+For frames **at or after** `sel_frame_idx`: routed through
+`identity_manager.update()` like the live phase.
 
-### Phase 5 — Process the remainder of the video
+### Phase 5 — Process the remainder
 
-`_run_frames(rest_bgr, …)` produces a stream of raw `FrameDetections`, each
-of which is fed to `identity_manager.update()`. The result list of fully
-labeled `FrameDetections` (containing **only** detections that map to a
-logical player) is returned.
+`_run_frames(rest_bgr, …)` produces raw `FrameDetections`, each fed to
+`identity_manager.update()`. The returned list contains **only** detections
+mapped to a logical player.
 
 ---
 
-## 3. Identity assignment — the 5-step cascade
+## 3. Identity assignment — `LogicalPlayerManager.update`
 
-`LogicalPlayerManager.update(fd)` is where occlusion recovery happens. For
-every frame it runs five ordered steps until each of the 4 logical players
-has either been assigned a detection or is left "missing" for that frame.
+Per frame, in order: **break hold → appearance-primary → direct track id →
+structural cascade (Steps 2–5) → finalize**.
 
-### Step 1 — Direct tracker-ID match
+### 3.0 Break hold (freeze while the court is empty)
 
-For each logical state whose `current_track_id` is present in this frame's
-detections:
+When zero valid in-court players are matched for `break_min_empty_sec`
+consecutive seconds (changeover, injury, long gap between points), the manager
+**enters a break**: it emits empty frames and freezes all logical state — no
+recovery, no `last_seen` bump. This stops the recovery cascade from snapping
+slots onto near-glass noise while nobody is playing.
 
-- If a court position exists and is *invalid* (not inside the court and not
-  exiting through a side door, see `_is_valid_player_position`), the match
-  is **rejected**. This guards against the tracker re-using a player's ID
-  on a spectator behind the glass. The state is then treated as missing.
-- Otherwise the assignment goes through (reason: `direct_track_id`).
+On break **exit**, `_reattach_after_break` runs. Teams may have swapped ends
+while the court was empty, so returning tracks are matched to logical players by
+**cosine similarity to each slot's EMA gallery — never by position**. Matching
+is Hungarian (scipy) with a greedy argmax fallback, accepting pairs above
+`reid_reattach_min_cosine` (0.3). Matched states have `team_side` re-derived
+from the new court position; `play_side` stays frozen. Leftover states and
+detections fall through to the normal cascade the same frame.
 
-The court-validity gate accepts:
-- Strict interior: `0 ≤ x ≤ W` and `0 ≤ y ≤ L`.
-- Side-door exits: `x < 0` or `x > W` while `DOOR_Y_MIN ≤ y ≤ DOOR_Y_MAX`.
+If no usable embeddings exist (bytetrack, or cold galleries), a warning is
+logged and the geometric cascade handles re-attach — teams may be mislabelled
+if they actually swapped ends.
 
-Everything else (e.g. spectators behind the far baseline) is rejected.
+### 3.1 Step 0 — Appearance-primary assignment (authority over geometry)
 
-If every state was matched directly, the frame is returned immediately
-(after team-side maintenance).
+Runs every frame once **every** logical player has a mature gallery, gated by
+`config.reid_primary` (default `True`). Detections are matched to logical ids by
+gallery cosine **ignoring position**. This is what carries identities correctly
+through an end-swap, which pure geometry inverts.
 
-### Step 2 — `same_role` structural reassignment
+Empirically OSNet separates the four players at ~0.98 cosine vs ~0.48 for
+position (see `scripts/analyze_player_separability.py`).
 
-For each *still-missing* state, find unassigned detections matching both its
-`team_side` and `play_side`. The pair is only committed if it is
-**symmetrically unique** — exactly one detection matches that state's role,
-**and** exactly one state matches that detection's role. This prevents two
-states from both fighting over the same quadrant during ambiguous frames.
+**Reference gallery** (`_ref_gallery`) is the frozen `emb_anchor` when built,
+else `emb_ema`. The anchor matters: because it cannot be poisoned by a later
+mislabel, a wrong id **self-corrects on the next frame** instead of locking in.
 
-Reason logged: `same_role`.
+**Doubles — two-tier, team-constrained.** Team membership (P1/P2 vs P3/P4) is
+fixed identity: a player can only ever be confused with their *teammate*, never
+an opponent. Only the court **side** flips on an end-swap. So:
 
-Unassigned detections are pre-filtered to those whose court depth is at
-least `min_direct_match_court_depth_m` (default 5 cm) — boundary noise is
-ignored.
+- **Tier 1** — assign each side's detections to a whole **team** atomically, by
+  which team's galleries collectively fit that side best (appearance, not
+  position). This moves a team across the net as a unit. Detections in the net
+  dead-zone have unknown side and are excluded from the tier-1 vote.
+- **Tier 2** — within a team+side, Hungarian-match its detections to its two
+  ids, accepting only pairs above `reid_primary_min_cosine` (0.5) that **also**
+  beat the teammate's cosine for that detection by `reid_primary_margin`
+  (0.05). Ambiguous teammate calls are left to geometry/direct-id.
 
-### Step 3 — `same_team_side` structural reassignment
+A detection is therefore never assigned to an opponent's id.
 
-Same symmetric-uniqueness pattern but now matching only on `team_side`
-(near vs far). Catches cases where two players on the same team have
-swapped left/right (e.g. one walked behind the other and the tracker
-shuffled IDs). Reason: `same_team_side`.
+**Singles (`_appearance_primary_singles`)** — no teams or L/R, so it's a single
+global Hungarian match with the same min-cosine and margin.
 
-### Step 4 — Proximity fallback
+For each accepted pair, `team_side` is re-derived from the **new** position
+(atomic per-player, logged as `SIDE-FOLLOW` when it flips), and the gallery is
+updated only when `cos >= reid_gallery_update_min_cosine` (0.6).
 
-Build a distance matrix between every remaining state's last known court
-position and every remaining detection's court position. Greedily assign
-the globally closest pair, then the next, etc., as long as the distance is
-≤ `proximity_max_distance_m` (default 3 m). Reason: `proximity`.
+### 3.2 Step 1 — Direct tracker-id match
 
-Only states/detections with court positions participate; detections without
-court positions are silently passed through.
+For each unmatched state whose `current_track_id` appears this frame:
 
-### Step 5 — One-to-one fallback
+- Rejected if the court position is **invalid** — not inside the court and not
+  exiting through a side door (`_is_valid_player_position`). This guards against
+  the tracker re-using a player's id on a spectator behind the glass.
+- Rejected if the detection is in the **door zone** and appearance does *not*
+  agree (`_appearance_agrees`): the embedding must match this player's
+  reference gallery above `reid_primary_min_cosine` and beat every other
+  player's gallery by `reid_primary_margin`. A tracker id alone is not trusted
+  there — that is exactly how a transitioning player inherits a wrong label (the
+  P4→P1 bug). When no galleries exist at all (bytetrack / cold start),
+  `_appearance_agrees` returns True so ReID never blocks a path it can't inform;
+  but when ReID *is* in play and the detection has no embedding, it returns
+  False.
 
-If exactly one state and exactly one detection remain after steps 1–4, pair
-them — provided the detection's position passes `_is_valid_player_position`.
-Reason: `one_to_one_fallback`.
+### The door zone
 
-### What happens to detections that nobody claims
+`_in_door_zone(det)` is True when the detection is in the door y-band
+(`net_y ± DOOR_HALF_WIDTH_M`, 2 m) **or** within `door_zone_edge_margin_m`
+(1 m) of any court edge — and also when it has no court position at all.
 
-They are simply **dropped** — `LogicalPlayerManager.update` returns
-`FrameDetections` containing only the assigned ones. The identity manager
-never invents detections for missing players; that frame just has fewer
-than 4 detections.
+Near the door and edges every player piles up at the same location, so position
+is meaningless. **In the door zone, assignment is ReID-only.** Door-zone
+detections are excluded from the entire geometric cascade (Steps 2–5); a
+door-zone detection with no confident gallery match is left **unassigned** for
+that frame rather than mislabelled, and re-acquires once clearly inside.
 
-`missing_frames` is incremented for any state that wasn't matched — but
-note that this counter is **never used to gate assignment**. It exists for
-logging only. The `max_missing_frames` config field is kept for backwards
-compatibility but no longer participates in decisions.
+### The recovery gate
 
-### `_assign` side effects
+Steps 2, 3, and 5 apply `_within_recovery_radius`: during the first
+`recovery_gating_window_sec` (2 s) after a player was lost, a candidate is
+rejected unless it lies within a radius that grows linearly from
+`recovery_gating_initial_radius_m` (1 m) at t=0 to
+`recovery_gating_final_radius_m` (3 m) at t=window. After the window the gate is
+off. It falls **open** when either side lacks a court position. This stops a
+nearby out-of-court spectator from capturing a slot during a brief miss.
 
-For every successful assignment:
+### The team invariant
 
-- `state.current_track_id` is updated to the new tracker ID (a track-ID
-  switch is logged for everything except `direct_track_id`).
-- `det.logical_player_id` is stamped and `det.visible = True`.
-- The state's last bbox, last court position, and last-seen frame are
-  updated. `missing_frames` resets to 0.
-- If the state had a court position **and** the detection's new position
-  crosses out of the valid region (side-door exit), `is_on_court` flips
-  from True → False, opening the side-change gate (see §3.5).
-- If `team_side`/`play_side` were `None` (e.g. the seed had no projection)
-  they're filled in opportunistically on the first valid position.
+`_det_team_side` is the single source of truth for which half of the net a
+detection is on: it returns `None` when the detection has no court position or
+lies inside the `net_deadzone_m` (0.5 m) band around the net line — side
+ambiguous, must not be teamed. Recovery **never crosses the net**: cross-net
+pairs are hard-rejected in the one-to-one fallback and set to `+inf` in the
+proximity distance matrix.
 
-### 3.5 — Team-side maintenance
+### 3.3 Step 2 — `same_role` structural reassignment
 
-After all assignments, `_update_team_sides` runs. It only acts if the
-side-change gate is open (a player has been observed leaving the court
-through a side door since the last side change). When the gate is open it
-checks whether team 1 (logical 1+2) and team 2 (logical 3+4) are observed
-exclusively in the far half vs the near half, and if so flips the global. # TODO: HEre is not checked if team2 left the court to enable a side change. So probably the method mentioned in _update_state_matched TODO would be better, which is to check if on court of one of the team players is true in a different side, and the players of the team occupying that side are not on court. This would allow to change sides during the match, and also to change back to the original side if needed.
+For each still-missing state, find unassigned detections matching both its
+`team_side` and `play_side` (plus the recovery gate). Committed only when
+**symmetrically unique** — exactly one detection matches that state's role and
+exactly one state matches that detection's role. This stops two states from
+fighting over the same quadrant during ambiguous frames.
 
-`team1_side` (with `_flip_state_team_sides` swapping near↔far and
-left↔right on every state). The gate then closes again.
+Singles have `play_side=None`, so `_same_role` always returns False and this
+step is a no-op.
 
-The resulting `FrameDetections.team_sides` map (`{1: …, 2: …}`) ships with
-every frame so downstream code (heatmaps, formations) can render team
-identity correctly even after the players have swapped courts between
-games.
+### 3.4 Step 3 — `same_team_side` structural reassignment
+
+Same symmetric-uniqueness pattern, matching on `team_side` only. Catches two
+teammates who swapped left/right (one walked behind the other and the tracker
+shuffled ids).
+
+### 3.5 Step 4 — Proximity fallback
+
+Distance matrix between every remaining state's `last_court_position` and every
+remaining detection's `court_position`, with cross-net pairs masked to `+inf`.
+Greedily assign the globally closest pair, then the next, while distance is
+≤ `proximity_max_distance_m` (3 m). Only states/detections that have court
+positions participate.
+
+### 3.6 Step 5 — One-to-one fallback
+
+If exactly one state and one detection remain, pair them — provided the position
+is valid, the recovery gate passes, **and** `_team_matches` holds. Each
+rejection is logged with its specific reason (`invalid_position`,
+`recovery_gate`, `cross_team`).
+
+### 3.7 What happens to unclaimed detections
+
+They are **dropped**. `update` returns `FrameDetections` containing only the
+assigned ones; the manager never invents detections for missing players.
+`missing_frames` is incremented for unmatched states but is **never used to gate
+assignment** — logging only. `max_missing_frames` is kept for backwards
+compatibility and no longer participates in decisions.
+
+### 3.8 `_assign` side effects
+
+- `state.current_track_id` ← the new tracker id (track-id switches are logged at
+  INFO for every recovery step; `direct_track_id` logs at DEBUG to avoid spam).
+- `det.logical_player_id` stamped, `det.visible = True`.
+- Last bbox / court position / last-seen frame updated; `missing_frames` reset.
+- `team_side` and `play_side` are filled in opportunistically if they were
+  `None` (e.g. a seed with no projection).
+- `is_on_court` flips True → False when the new position is a side-door exit
+  (`x < 0` or `x > W` while in the door y-band), which **opens the side-change
+  gate**.
+- The ReID gallery is updated (`_update_gallery`), but only when `gallery_ok`
+  (the caller's confidence flag) **and** the position is a valid in-court one —
+  so near-glass and spectator crops never leak into the appearance model.
+
+### 3.9 The ReID gallery (`_update_gallery`)
+
+Two embeddings per logical player, both L2-normalized:
+
+- **Anchor** (`emb_anchor`) — a running mean of the first `reid_anchor_samples`
+  (60) clean confident samples, then **frozen**. This is the primary matching
+  reference precisely because it can't drift.
+- **EMA** (`emb_ema`) — `emb = α·emb + (1−α)·e` with `α = reid_gallery_alpha`
+  (0.9), mirroring boxmot's `update_emb`. Fast, adapts to lighting/pose; used as
+  the secondary signal and for post-break re-attach.
+
+No-ops on a missing or zero-norm embedding, so ReID stays entirely optional.
+
+### 3.10 Finalize: team-side maintenance & break bookkeeping
+
+`_finalize` runs `_update_team_sides`, then updates the empty-court streak
+(entering a break at `break_min_empty_sec`, resetting on any valid in-court
+player) and emits.
+
+`_update_team_sides` acts only when the side-change gate is open (a player has
+been observed leaving through a side door since the last change). It checks
+whether team 1 and team 2 are observed exclusively in opposite halves and, if
+so, flips `team1_side` and calls `_flip_state_team_sides` — which swaps
+`near ↔ far` on every state but leaves `play_side` untouched, since own
+left/right does not change when a team physically swaps ends. The gate then
+closes.
+
+> **Known limitation (TODO in code).** The gate never checks whether the *other*
+> team left the court, and it is not re-closed when a player returns to the same
+> side. A better rule: allow the change when one team member is on court on a
+> different side *and* the players of the team occupying that side are not on
+> court — which would also permit swapping back.
+
+`FrameDetections.team_sides` (`{1: …, 2: …}`) ships with every frame so
+downstream code (heatmaps, formations) renders team identity correctly even
+after players swap courts between games.
+
+At DEBUG level a per-frame slot snapshot is logged, e.g.
+`+P1[T1-L n]=tid7 xP2[T1-R n]=tid3 … gate=closed`, where `+` = assigned this
+frame and `x` = missing.
 
 ---
 
@@ -323,44 +455,72 @@ games.
 | Case | How it's handled |
 |---|---|
 | Empty input | `detect_and_track` returns `[]` immediately. |
-| Stride > 1 (sub-sampled analysis) | Tracker re-initialized with `effective_fps` so `max_age` stays calibrated in seconds; absolute frame indices reconstructed via `start_frame + i*stride`. |
-| Modal / weird `CUDA_VISIBLE_DEVICES` | DeepOCSORT is given device index `0` instead of `"cuda"` to bypass boxmot's string validation. |
-| DeepOCSORT Kalman blow-up | `np.linalg.LinAlgError` from `deep_tracker.update` caught; empty tracks returned for that frame. |
-| Box garbage (NaN, inverted, micro, weird aspect, fully off-screen) | Rejected pre-tracker by `filter_sv_detections_for_tracking`. |
-| Pose model misaligned with detection box | Pose features are dropped if IoU < `pose_iou_threshold`; foot falls back to `bbox.bottom_center`. |
-| One ankle keypoint missing or low-confidence | Use the other; if both missing, no ankle midpoint. |
-| Missing court projection | Court positions left `None`, ROI filter is a no-op, automatic selection cannot run, structural and proximity steps fall back to direct-ID-only matching. |
-| Auto-selection finds < 4 in-court players | Warning logged, partial seed used; missing logical IDs are simply absent until they appear later (and even then only direct track-ID matches will rescue them, since their `last_court_position` was never set). |
-| Manual selection cancelled | `PlayerSelectorUI.select` raises `RuntimeError` and the pipeline aborts. |
-| Manual selection short of 4 | Warning logged, manager initialized with however many were clicked. |
-| Spectator inheriting a player's tracker ID | `_is_valid_player_position` rejects matches outside court + side-door region in Step 1 and Step 5; player falls through to structural/proximity steps. |
-| Boundary noise (player straddling line at ~0 m depth) | Filtered out of the unassigned pool when `_court_depth < min_direct_match_court_depth_m`. |
-| Two players cross & swap tracker IDs (same team) | Step 3 (`same_team_side`) typically fixes it; if still ambiguous, Step 4 (`proximity`) picks the nearest. |
-| Two players cross & swap roles entirely (same role bucket) | Step 2 (`same_role`) fixes it. |
-| All four players' tracker IDs explode at once | Step 4 (`proximity`) reassigns each to the closest detection within 3 m. If still ambiguous, Step 5 handles the very last 1↔1 pair. |
-| Players swap court ends between games | A side-door exit opens the side-change gate; `_update_team_sides` then detects "team 1 is all far, team 2 is all near" (or vice versa) and flips `team1_side` plus every state's `team_side`/`play_side`. The gate closes again until the next exit. |
-| Tracker ID briefly disappears (occlusion) | Step 1 simply doesn't match this frame; `missing_frames` is bumped. On reappearance the same tracker ID is matched again by Step 1 (if DeepOCSORT's ReID kept it) or recovered via Steps 2–5 (if ID changed). |
-| Detections that don't correspond to any logical player | Silently dropped from output — only assigned detections survive. |
-| Frame before the selection-winning frame | Logical ID copied directly from the initial tracker-ID→logical-ID map; detections with tracker IDs not in the seed set are dropped. |
-| First few seconds before the seed frame have no projection | The fallback assigns logical IDs even with no court info, since it uses tracker IDs only. |
+| Stride > 1 (sub-sampled analysis) | Tracker re-initialized with `effective_fps`; absolute indices via `start_frame + i*stride`. |
+| Singles match | `match_type="singles"` → 2 players on a 6 × 20 m court; `play_side` is `None`, Step 2 no-ops, appearance-primary uses the global-match variant. |
+| RF-DETR short final batch | Padded with repeated frames to `config.batch_size` (the JIT graph is batch-size-specific); padding results dropped. |
+| RF-DETR class-id confusion | Person id resolved from the dict-keyed `COCO_CLASSES` mapping, not `class_names`; then renormalized to `person_class_id`. |
+| Modal / non-numeric `CUDA_VISIBLE_DEVICES` | DeepOCSORT is given device index `0` instead of `"cuda"`. |
+| boxmot ≥ 18 API change | `ReID` backend built explicitly and `.model` passed as `reid_model=`; non-None asserted at init (CV-003). |
+| DeepOCSORT Kalman blow-up | `np.linalg.LinAlgError` caught; empty tracks for that frame. |
+| Box garbage (NaN, inverted, micro, weird aspect, off-screen) | Rejected pre-tracker by `filter_sv_detections_for_tracking`. |
+| Pose model misaligned with detection box | Dropped if IoU < `pose_iou_threshold`; foot falls back to `bbox.bottom_center`. |
+| One ankle keypoint missing / low-confidence | Use the other; if both missing, no ankle midpoint. |
+| Missing court projection | Court positions `None`, auto-selection cannot run, structural/proximity steps fall back to direct-id-only matching. |
+| ByteTrack (no embeddings) | Every ReID path no-ops: no galleries, appearance-primary skipped, `_appearance_agrees` returns True so it never blocks. Pure geometric cascade. |
+| Auto-selection finds < n_players | Warning logged, partial seed used; empty slots keep their `play_side` and are filled once the player appears. |
+| Manual selection cancelled / short | ESC raises `RuntimeError`; a short selection logs a warning and proceeds. |
+| Spectator inheriting a player's tracker id | `_is_valid_player_position` rejects it in Steps 1 and 5; the recovery gate blocks distant captures within the 2 s window. |
+| Boundary noise (player at ~0 m depth) | Excluded from the unassigned pool below `min_direct_match_court_depth_m`. |
+| Player transitioning through the door | Door zone is ReID-only: geometric steps never assign there, and a direct track-id match must be confirmed by appearance. No confident match → left unassigned this frame. |
+| Two teammates cross & swap tracker ids | Appearance-primary tier 2 usually fixes it; else Step 3 (`same_team_side`), else Step 4 (`proximity`). |
+| Teams swap court ends mid-match | Appearance-primary tier 1 moves a whole team across the net as a unit (`SIDE-FOLLOW`), which pure geometry would invert. `_update_team_sides` maintains the reported `team_sides` map. |
+| Court empties (changeover / injury / long break) | Break entered after `break_min_empty_sec`; state frozen, empty frames emitted; on return, `_reattach_after_break` re-attaches by appearance, not position. |
+| A mislabel slips through | The frozen anchor gallery cannot be poisoned (gallery updates also require `cos ≥ reid_gallery_update_min_cosine`), so the next frame's appearance match self-corrects. |
+| Tracker id briefly disappears (occlusion) | Step 1 doesn't match; on reappearance the same id matches again, or Steps 2–5 recover it under the growing radius gate. |
+| Detections matching no logical player | Silently dropped — only assigned detections survive. |
+| Frames before the selection-winning frame | Logical id copied from the initial tracker-id map; other detections dropped. |
 
 ---
 
 ## 5. Outputs
 
-`detect_and_track` returns a `list[FrameDetections]` covering every frame in
-the input iterator. For each frame:
+`detect_and_track` returns a `list[FrameDetections]` covering every frame in the
+input iterator. Per frame:
 
-- `detections` contains **only** items that have been mapped to a logical
-  player (1–4). `det.logical_player_id` is set, `det.visible = True`,
-  `det.is_on_court` reflects the current on-court state.
-- `det.court_position` is in meters (origin near-baseline-left) when a
-  homography was available.
-- `det.ankle_midpoint` and `det.keypoints` are populated when pose was run
-  and a confident match existed.
-- `fd.team_sides` describes which team (1 or 2) is currently on the near/far
-  side. It updates automatically when a side change is detected.
+- `detections` contains **only** items mapped to a logical player.
+  `det.logical_player_id` is set, `det.visible = True`, `det.is_on_court`
+  reflects the current on-court state.
+- `det.court_position` is in meters (origin at the near-baseline-left corner)
+  when a homography was available.
+- `det.ankle_midpoint` and `det.keypoints` are populated when pose ran and a
+  confident match existed.
+- `det.embedding` carries the OSNet appearance vector under DeepOCSORT.
+- `fd.team_sides` describes which team is currently near/far, updating on a
+  detected side change.
 
-Frames where fewer than 4 logical players were recovered simply contain
-fewer detections — there is no padding or interpolation at this layer; the
-metrics module is responsible for filling short gaps later.
+Frames where fewer players were recovered simply contain fewer detections — and
+break frames contain none. There is no padding or interpolation at this layer;
+the metrics module fills short gaps later.
+
+---
+
+## 6. Key tunables (`PlayerTrackerConfig`)
+
+| Knob | Default | Effect |
+|---|---|---|
+| `match_type` | `doubles` | Resolves player count + court dimensions. |
+| `detector_type` | `rfdetr` | RF-DETR (Apache-2.0) vs YOLO (AGPL). |
+| `tracker_type` | `deepocsort` | `bytetrack` disables all ReID paths. |
+| `tracker_max_age_sec` | 10.0 | How long boxmot keeps a track alive unmatched. Keep modest — see §1. |
+| `selection_window_sec` | 2.0 | Length of the seeding window (min 30 frames). |
+| `net_deadzone_m` | 0.5 | Band around the net where team side is "unknown". |
+| `door_zone_edge_margin_m` | 1.0 | Edge margin defining the ReID-only door zone. |
+| `proximity_max_distance_m` | 3.0 | Max Step 4 assignment distance. |
+| `recovery_gating_window_sec` / `_initial_radius_m` / `_final_radius_m` | 2.0 / 1.0 / 3.0 | Growing-radius gate for Steps 2, 3, 5. |
+| `break_min_empty_sec` | 2.0 | Empty-court duration before freezing state. |
+| `reid_primary` | `True` | Appearance overrides geometry each frame. |
+| `reid_primary_min_cosine` / `reid_primary_margin` | 0.5 / 0.05 | Accept threshold and clarity margin over the runner-up. |
+| `reid_gallery_update_min_cosine` | 0.6 | Confidence needed to fold a sample into a gallery. |
+| `reid_anchor_samples` | 60 | Clean samples averaged before the anchor freezes. |
+| `reid_gallery_alpha` | 0.9 | EMA decay for the fast gallery. |
+| `reid_reattach_min_cosine` | 0.3 | Looser threshold for post-break re-attach. |

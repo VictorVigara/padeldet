@@ -79,6 +79,10 @@ class TrackedDetection(Detection):
     is_on_court: bool = True
     ankle_midpoint: tuple[float, float] | None = None
     keypoints: list[tuple[float, float, float]] | None = None  # (x, y, conf) per COCO keypoint — 17 joints in COCO order
+    # Transient per-frame appearance embedding (e.g. OSNet ReID, 512-dim L2-normalized).
+    # Used live by the identity manager's ReID gallery; deliberately NOT serialized
+    # (large float array, not needed downstream) and excluded from dataclass equality.
+    embedding: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def serialize(self) -> dict:
         data = super().serialize()
